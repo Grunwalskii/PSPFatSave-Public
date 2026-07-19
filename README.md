@@ -12,6 +12,12 @@ No other CFW will ever be supported
 
 Don't use Save or Load during a game's loading screens or videos. From the game's normal menu should be fine.
 
+## Support
+
+If you enjoy this project and want to support its development, you can buy me a coffee:
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/W1L623I6WG)
+
 ## Features
 
 **Savestates**
