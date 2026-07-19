@@ -113,6 +113,12 @@ Produces `pspfatsave.prx`. Copy it to `ms0:/seplugins/` and enable it in your pl
 
 MIT - see [LICENSE](LICENSE). FastLZ source files carry their own MIT header.
 
+## Support
+
+If you enjoy this project and want to support its development, you can buy me a coffee:
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/W1L623I6WG)
+
 ## Disclaimer
 
 This plugin is provided free of charge and as-is. The author accepts no
