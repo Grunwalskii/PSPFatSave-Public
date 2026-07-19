@@ -1,0 +1,29 @@
+# PSP build artifacts
+build/
+*.o
+*.elf
+*.prx
+exports.c
+
+# Libraries
+*.a
+*.lib
+
+# Debug
+*.map
+*.lst
+
+# OS junk
+Thumbs.db
+.DS_Store
+Desktop.ini
+
+# Editor
+.vscode/*
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
