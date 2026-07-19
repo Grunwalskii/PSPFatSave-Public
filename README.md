@@ -53,6 +53,8 @@ If you enjoy this project and want to support its development, you can buy me a 
 - Overclock (PSP-1000 only; raw PLL registers, 0 = stock 333MHz)
 - Debug Messages (UART logging + on-screen markers, debug build only)
 
+![PSPFatSave Screenshot](https://raw.githubusercontent.com/Grunwalskii/PSPFatSave-Public/main/Screens.png)
+
 ## Why this exists
 
 [PSPStates v2](https://github.com/PSP-Archive/PspStates-Experiment) (the classic savestate plugin, by Dark-Alex) only supports PSP Slim/Brite and later models, which have 64MB of RAM — double the Phat's 32MB. V2 saves state in one shot by copying the live lower 32MB into a spare, otherwise-unused upper 32MB bank while the firmware is suspended.
