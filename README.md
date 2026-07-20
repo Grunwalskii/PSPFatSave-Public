@@ -81,6 +81,10 @@ Save and load within the same game session works reliably, repeated any number o
 
 If a game doesn't work for you, please open an issue with at least: the plugin version, which game, what was happening in the game at the time, and the debug log if logging was enabled.
 
+FAQ:
+Q1: Why is the Plugin overloaded with other features?
+A1: Because I made it for myself and want all of it in one place. It evolved from simple "SaveState" PSP1000 Port into everything i want on the PSP.
+
 ## Building
 
 Requires:
