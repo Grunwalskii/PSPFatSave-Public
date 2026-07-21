@@ -1,3 +1,6 @@
+# To the people who still not undertand AI use as at tool you can find the original commits history with over 240 hours of work time here:
+![Commits](https://github.com/Grunwalskii/PSPFatSave-Public/blob/main/OriginalCommitsHistory)
+
 # PSPFatSave
 
 A savestate plugin for the PSP-1000 ("Phat"), running under [ARK-4](https://github.com/PSP-Archive/ARK-4) CFW 6.61. It lets you freeze and restore a running game's full state (kernel + game RAM + VRAM) to the Memory Stick.
