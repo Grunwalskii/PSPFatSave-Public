@@ -1,5 +1,5 @@
 # To the people who still not undertand AI use as at tool you can find the original commits history with over 240 hours of work time here:
-![Commits](https://github.com/Grunwalskii/PSPFatSave-Public/blob/main/OriginalCommitsHistory)
+https://github.com/Grunwalskii/PSPFatSave-Public/blob/main/OriginalCommitsHistory
 
 # PSPFatSave
 
