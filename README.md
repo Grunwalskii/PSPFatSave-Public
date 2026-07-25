@@ -70,6 +70,7 @@ The Phat has no spare bank: just 8MB kernel + 24MB game RAM, all of it live. Thi
 ## Status
 
 **Beta.** Please read before using:
+- Current does not work on POPS (PS1) Games, because I never tested them. 
 - Do not expect it to work with other plugins ("prxshot_png_mod_by_lman_v0.2_fixed" for example messes up OC Warning message, Auto Start and Intro Skipp function)
 - Can corrupt the Memory Stick (has not happened in testing so far).
 - Can reset PSP system settings (happened once; since fixed).
