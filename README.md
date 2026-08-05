@@ -13,6 +13,7 @@ No other CFW will ever be supported
 
 ## Instructions
 
+Press the "Note" button in game to open the menu.
 Don't use Save or Load during a game's loading screens or videos. From the game's normal menu should be fine.
 
 ## Support
