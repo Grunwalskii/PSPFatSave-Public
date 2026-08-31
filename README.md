@@ -89,6 +89,8 @@ The Phat has no spare bank: just 8MB kernel + 24MB game RAM, all of it live. Thi
 - Currently does not work on POPS (PS1) Games, because I never tested them.
 - Games on UMD untested, because I don't have a UMD drive. Please leave feedback if that works, at least two games tested preferably.
 - Do not expect it to work with other plugins ("prxshot_png_mod_by_lman_v0.2_fixed" for example messes up OC Warning message, Auto Start and Intro Skipp function)
+- Screen Tuning and FPS Unlocks are experimental and can cause instability or crashes in some games - test in gameplay before relying on them.
+- Some games may fail to start at all with the plugin enabled, or crash in general, independent of any specific feature.
 - Can corrupt the Memory Stick (has not happened in testing so far).
 - Can reset PSP system settings (happened once; since fixed).
 - No guarantee that a save succeeds — there is a real chance of a crash and loss of any unsaved progress.
