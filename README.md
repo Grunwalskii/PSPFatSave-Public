@@ -126,7 +126,7 @@ make DEBUG_BUILD=0
 
 Produces `pspfatsave.prx`. Copy it to `ms0:/seplugins/` and enable it in your plugins config. (GAME only - "game, pspfatsave.prx, on")
 
-For the FPS Unlocks feature, place a CWCheat-format `cheat.db` in `ms0:/seplugins/` too (a copy is included in each release's zip).
+For the FPS Unlocks feature, place a CWCheat-format `cheat.db` in `ms0:/seplugins/` too (a copy is included in each release's zip, sourced from [CWCheat-Database-Plus-](https://github.com/Saramagrean/CWCheat-Database-Plus-)).
 
 ## Credits
 
@@ -136,6 +136,7 @@ For the FPS Unlocks feature, place a CWCheat-format `cheat.db` in `ms0:/seplugin
 **Libraries & Assets**
 - Bundles [FastLZ](http://fastlz.org/) (MIT licensed, see file headers in `src/plugin/fastlz_*.c`) for save compression.
 - Font from [PSP-HUD](https://github.com/ErikPshat/PSP-HUD) by Erik Pshat, used in the on-screen overlay.
+- `cheat.db` (bundled in each release's zip, for the FPS Unlocks feature) is from [CWCheat-Database-Plus-](https://github.com/Saramagrean/CWCheat-Database-Plus-) by Saramagrean.
 
 **Build & Dependencies**
 - Built against [PSPSDK](https://github.com/pspdev/pspsdk) and [ARK-4](https://github.com/PSP-Archive/ARK-4).
