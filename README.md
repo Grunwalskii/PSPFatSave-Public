@@ -1,4 +1,4 @@
-## For those who still don't understand that AI was just used as a tool, you can find the original commit history proving over 240 hours of work here:
+## For those who still don't understand that AI was just used as a tool, you can find the original commit history proving over 360 hours of work here:
 https://github.com/Grunwalskii/PSPFatSave-Public/blob/main/OriginalCommitsHistory
 
 # PSPFatSave
