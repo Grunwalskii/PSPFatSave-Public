@@ -25,10 +25,7 @@
 // event_id
 #define PSP_SYSEVENT_RESUME_COMPLETED			0x400000
 #define PSP_SYSEVENT_KERNEL_POWER_LOCK_PHASE1	0x401
-// LAST suspend sysevent before power-down (uofw sysmem_sysevent.h):
-// suspend order is QUERY->START->PHASE2(16..0)->PHASE1(0..2)->FREEZE->
-// PHASE0(15..0), and PHASE0_0 fires LAST = fully quiesced. This is where
-// we touch/overwrite kernel RAM so resume continues from it consistently.
+// LAST suspend sysevent before power-down; fires when the firmware is fully quiesced.
 #define SCE_SYSTEM_SUSPEND_EVENT_PHASE0_0		0x4000
 
 // Sleep-hybrid flags/buffer (shared fatsave.c <-> utils.c).
@@ -50,14 +47,12 @@ struct load_carry { volatile u32 op_mode; volatile int verify_mbps; volatile int
 extern volatile struct load_carry g_lc;
 extern volatile u32 g_dma_drain_left; // mode-9 DMAC drain residual (0=drained); logged post-resume
 
-// ── Save-time dispatcher-context handoff (cross-session load fix) ──
+// ── Save-time dispatcher-context handoff ──
 // g_handoff_ctx: filled by SysEventShim (extras.S) at the entry of EVERY sysevent
 // dispatch — s0-s7, fp, gp, sp, ra, CP0 Status (word layout in extras.S). Lives in
 // plugin .data inside the kernel image, so the SAVE's mode-9 capture embeds the
 // save-time dispatcher-return context in every snapshot. The LOAD's ApplyHandoff
-// (apply.S) restores it from the applied image and jumps to the save-time ra —
-// the load session is abandoned instead of returning through load-session code
-// whose addresses no longer match the applied image (the cross-session hang).
+// (apply.S) restores it from the applied image and jumps to the save-time ra.
 // g_handoff_ctx_addr: LOAD side — the SAVE-TIME address of g_handoff_ctx (from the
 // save header), passed to ApplyHandoff by mode 10. 0 = no handoff armed (DIAG paths).
 extern volatile u32 g_handoff_ctx[16];
@@ -75,13 +70,11 @@ extern int g_overclock_id;
 void oc_apply(int id);
 
 // Compression chunk size. fastlz processes the game RAM / VRAM / kernel in
-// SAVE_CHUNK_SIZE input chunks. 64KB benchmarked faster than 32KB (fewer sceIo
-// calls + a better compression ratio) and is the speed sweet spot.
+// SAVE_CHUNK_SIZE input chunks.
 #define SAVE_CHUNK_SIZE   0x10000   // 64KB input chunks
 // work_buf holds one record: [8-byte header][fastlz output]. fastlz can EXPAND
-// incompressible data, so size for its worst case: input + ~6.25% + the 8-byte
-// header + slack (fastlz's contract is "5% larger, min 66 bytes"; input/16 = 6.25%
-// stays safely above that). For 64KB that's ~68KB — not the old fantasy 128KB.
+// incompressible data, so size for its worst case: input + ~6.25% (fastlz's
+// contract "5% larger, min 66 bytes") + the 8-byte header + slack.
 // (Derived from SAVE_CHUNK_SIZE so it stays correct if the chunk size changes.)
 #define COMPRESS_BUF_SIZE (SAVE_CHUNK_SIZE + (SAVE_CHUNK_SIZE / 16) + 128)
 
@@ -94,17 +87,11 @@ void oc_apply(int id);
 // write_region_direct / read_region_direct. Mask it off to recover the offset.
 #define SAVE_FLAG_UNCOMPRESSED 0x80000000u
 #define SAVE_VRAMPOS_MASK      0x7FFFFFFFu
-// Save header size in u32 words. 10 -> 12: [10] = save-time &g_handoff_ctx (the
-// dispatcher-context block ApplyHandoff restores from the applied image), [11] =
-// VRAM section offset (see above). 12 -> 13: [12] = save-time &g_overclock_id —
-// the kernel rollback on LOAD would otherwise restore the SAVE's own overclock
-// setting instead of the CURRENT session's; FreezeLoad patches the CURRENT live
-// g_overclock_id into the staged snapshot at this offset (same technique as
-// g_op_mode's patch), so "current session wins" over whatever a given save was
-// made at. Both FreezeSave and FreezeLoad size their header[] with this so the
-// section offsets (sizeof(header)) stay symmetric. Old (12-word) saves fail the
-// CRC check under a 13-word header (the verify range shifts) — clean, resumable
-// "Load aborted", not a hard failure — re-save under this build to carry it.
+// Save header size in u32 words: [10] = save-time &g_handoff_ctx (the dispatcher-
+// context block ApplyHandoff restores), [11] = VRAM section offset (see above),
+// [12] = save-time &g_overclock_id — FreezeLoad patches the CURRENT live
+// g_overclock_id into the staged snapshot at this offset. Both FreezeSave and
+// FreezeLoad size their header[] with this so section offsets stay symmetric.
 #define SAVE_HEADER_WORDS 13
 
 // Game memory regions to save (24MB user RAM — safe for both Phat & Slim)
@@ -115,44 +102,24 @@ void oc_apply(int id);
 #define MAIN_RAM_SIZE          0x01800000  // 24MB
 #define VRAM_SIZE              0x00200000  // 2MB (Phat); Slim has 4MB but save 2MB for compat
 
-// Kernel partition. The lower 8MB (0x88000000-0x88800000) splits (firmware
-// partition table, sysmem.c) into: 4MB REAL kernel (0x88000000-0x88400000:
-// other1 3MB + other2 1MB — TCBs, semaphores/event-flags/timers, exception
-// vectors, and this plugin incl. g_handoff_ctx, which loads at ~0x88200000)
-// and 4MB "vshell"/volatile scratch (0x88400000-0x88800000, the region
-// sceKernelVolatileMemLock hands out). The game releases + rebuilds volatile
-// across the freeze (cooperative_volmem_release), so its contents are
-// don't-care — we capture/restore ONLY the lower 4MB. Capture/apply run at
-// PHASE0_0 (fully firmware-quiesced), where this range is readable/writable;
-// it is not under a live hard freeze (intr_suspend()), where the low pages fault.
+// Kernel partition. The lower 8MB (0x88000000-0x88800000) splits into 4MB real
+// kernel (0x88000000-0x88400000: TCBs, semaphores/event-flags/timers, exception
+// vectors, this plugin incl. g_handoff_ctx) and 4MB "vshell"/volatile scratch
+// (0x88400000-0x88800000, handed out by sceKernelVolatileMemLock). The volatile
+// contents are don't-care across the freeze, so we capture/restore ONLY the
+// lower 4MB.
 #define KERNEL_RAM_BASE        0x88000000
 #define KERNEL_RAM_SIZE        0x00400000  // 4MB: 0x88000000 .. 0x88400000 (real kernel; skips volatile)
 
 // Batched-I/O buffer = the FULL 4MB vshell/volatile scratch (0x88400000-
 // 0x88800000). Accumulates many compressed records and flushes in a few large
-// writes (killing the per-small-write cluster read-modify-write cost). Two
-// gates, both understood now:
-//  - DDR MPU nibbles (0xBC000008 = ME half parts 16-23, 0xBC00000C = GE/AW
-//    half parts 24-31): power.prx zeroes them (all-denied) the moment the
-//    game releases the volatile lock; any access under 0x0 hangs. Every use
-//    goes through iobuf_open_verified() (set 0xF = the lock-holder value on
-//    BOTH regs, readback-verify, settle, retry; per-chunk work_buf fallback).
-//  - What looked like a second, address-based gate on the ME half
-//    (0x88400000-0x88600000) — bulk fills there froze v397/v398 even under a
-//    verified 0xF — turned out to be the SAME root cause as the freezes on
-//    the GE/AW half (v399): an unaligned u32 header store in the packed
-//    record writer (MIPS faults on unaligned word access). Fixed at the
-//    record level (memcpy, not direct pointer stores), so BOTH halves are
-//    fully usable — v401's probe proved the ME half fills/verifies clean.
-// Contents are don't-care across the freeze (game releases + rebuilds
-// volatile; firmware clobbers it at suspend/resume) — NOT usable for the
+// writes. Contents are don't-care across the freeze — NOT usable for the
 // kernel section, which straddles the suspend. Sits directly below game RAM,
 // so no overlap with the RAM/VRAM being saved.
 #define IOBUF_BASE             0x88400000
 #define IOBUF_SIZE             0x00400000  // 4MB: both halves
-// The two MPU regs the 4MB spans (see above) — iobuf_open_verified/
-// iobuf_still_open must check BOTH, since a partial revoke (one half zeroed,
-// the other not) is just as unsafe as a full one.
+// The two MPU regs the 4MB spans — iobuf_open_verified/iobuf_still_open
+// must check BOTH.
 #define IOBUF_MPU_REG_LO       0xBC000008   // ME half, 0x88400000-0x885FFFFF
 #define IOBUF_MPU_REG_HI       0xBC00000C   // GE/AW half, 0x88600000-0x887FFFFF
 
@@ -160,17 +127,11 @@ void oc_apply(int id);
 // so the staging region IS game RAM — freed by writing it to MS first). The 24MB
 // user partition splits into three 8MB slots (Low/Mid/High); the kernel snapshot
 // stages in whichever the Settings "Stage spot" selects (g_stage_base, default Mid
-// 0x89000000 — the slot that avoids both GTA's low-RAM DMA and the firmware's
-// top-RAM suspend bookkeeping). KSEG1 (|0x20000000) = uncached alias for executing
-// copied code without icache flushes (VRAM/eDRAM exec fails; main-RAM works).
+// 0x89000000). KSEG1 (|0x20000000) = uncached alias for executing copied code
+// without icache flushes.
 // GAME_STAGE_KERNEL is the legacy default base (Low); the runtime path uses g_stage_base.
 // The LOAD apply routine + its scratch stack live at the START of the upper 8MB (High
-// slot), immediately above the Mid snapshot — clear of the Mid/Low staging slots and
-// the kernel window it overwrites, AND clear of the firmware's top-of-RAM suspend
-// bookkeeping (the old top-64KB spot 0x89FF0000 sat right in that region and could be
-// clobbered mid-suspend). (High-slot staging still overlaps this 64KB, so High is
-// save-only; Mid/Low are load-safe.) A LOAD's game-RAM restore later clobbers it, so
-// reusing game data here is fine.
+// slot), immediately above the Mid snapshot.
 #define GAME_STAGE_APPLY       0x89800000  // apply routine (LOAD only): start of upper 8MB
 #define KSEG1_ALIAS            0x20000000  // add to a KSEG0 (0x8x) addr -> KSEG1 (0xAx) uncached
 
@@ -212,6 +173,13 @@ extern int g_uart_log;
 #define DBG_UART() 0
 #endif
 
+// InterruptManagerForKernel (pspsdk -lpspkernel stubs; classic stable NIDs).
+// Shared by the ME-probe UID-tree walk (fatsave.c), the submit single-flight
+// claim (screen_tuning.c) and the PLL sequence (overclock.c). Prototypes match
+// the SDK's pspintrman.h exactly (harmless duplicate if that header is in).
+unsigned int sceKernelCpuSuspendIntr(void);
+void sceKernelCpuResumeIntr(unsigned int flags);
+
 // Software threshold (in KB) at which the compressed save/load loops flush the
 // accumulated IOBUF to the Memory Stick, and the chunk size the Fast-mode direct
 // path uses per sceIoWrite/Read. Fixed at 1MB (no longer a menu setting). The
@@ -224,8 +192,6 @@ extern int g_compress;
 //   VSKIP_OFF(0)     - off (default)
 //   VSKIP_CAPTURE(1) - next boot shows a banner and learns the intro length from the user
 //   VSKIP_TIMED(2)   - fire the skip for g_video_skip_ms from the boot anchor
-// See the video_skip_* block in videoskip.c for why a learned window beat every automatic
-// signal we tried.
 extern int g_video_skip;
 // The learned intro length in ms (gameset.cfg word 5), valid when g_video_skip==VSKIP_TIMED.
 extern int g_video_skip_ms;
@@ -238,11 +204,36 @@ extern int g_stage_spot;         // kernel-snapshot staging slot (0=Low 1=Mid 2=
 extern int g_autoload;           // per-game auto-open-on-boot
 extern int g_frame_limit;        // per-game frame cap (0=off, else target FPS)
 extern int g_overclock_stable;   // overclock marked stable (skip boot confirm)
-extern int g_show_fps_overlay;   // FPS overlay window (0=off,1/2/3)
-extern int g_fps_show_lows;      // draw 1% low alongside FPS
+extern int g_show_fps_overlay;   // Show-FPS MODE: 0=off 1=FPS 2=FPS+1% 3=FPS+1%+Frametime
+extern int g_fps_rate;           // FPS overlay update rate in 0.1s units (1..10 = 0.1..1.0s)
+extern int g_fps_show_lows;      // DERIVED from the mode (>=2): draw 1% low alongside FPS
 extern int g_show_battery;       // battery overlay (0=off,1/2/3)
+extern int g_batt_real_mah;      // user's real battery capacity mAh (0 = stock/BMS value); scales the mAh display
+extern int g_batt_stop_charge;   // Stop-Charging threshold % (0=OFF, else 80..95); enforced by battery_poll_thread
 extern int g_show_cpu_usage;     // CPU load overlay
-extern int g_show_ft_chart;      // scrolling frametime histogram
+extern int g_show_ft_chart;      // DERIVED from the mode (==3): scrolling frametime histogram
+extern int g_overlay_pos;        // overlay anchor corner: 0=UpL 1=UpR 2=DownL 3=DownR (fps_draw)
+// One-time Welcome screen seen flag (persisted in settings.cfg word [12], the
+// formerly-free slot). 0 = the beta/welcome page has not been shown yet; 1 = the
+// user pressed X and it should never appear again.
+extern int g_welcome_shown;
+// IPS midtone gamma strength, 0=off..100 (see screen_tuning.c). Paired with
+// g_st_temp (colour temperature, declared in screen_tuning.h) — either one off
+// its neutral value runs the pass; see st_active().
+extern int g_st_gamma;
+// Live screen-tuning HUD (X on the Settings gamma row): the menu closes
+// completely and both values are tuned against the RUNNING game via the D-Pad
+// (U/D gamma, L/R temperature), with a banner on screen. 1 = HUD up. The
+// controller hook owns the D-Pad/X/O while it is (st_hud_mask).
+extern volatile int g_st_hud;
+extern volatile int g_st_hud_dirty;   // edited by the HUD; worker persists it on close
+
+// Screen-tuning power coordination (screen_tuning.c). Called from ProcessSignals:
+// st_pwr_suspend() on the first suspend-descent phase (stands the gamma pass down
+// before the firmware tears the GE down); st_pwr_resume() on RESUME_COMPLETED (arms
+// a DELAYED re-enable so the game is shown before the correction re-applies).
+void st_pwr_suspend(void);
+void st_pwr_resume(void);
 
 // Disc id + "_" + 8-hex ISO-master hash (provided by systemctrl). Shared by the
 // core, menu browser, and video-skip per-game settings.
@@ -270,10 +261,9 @@ static inline void intr_resume(u32 sr) {
 }
 
 // Kernel-freeze save/load. Each suspends the game's user threads on entry and
-// resumes them on exit. (The old manage_freeze=0 caller-owned-freeze and
-// restore_kernel=0 baseline-load variants were removed — see git history.)
-// FreezeLoad applies the save-time kernel via the staged firmware suspend; on
-// success the handoff jumps into the save-time session and never returns here.
+// resumes them on exit. FreezeLoad applies the save-time kernel via the staged
+// firmware suspend; on success the handoff jumps into the save-time session and
+// never returns here.
 int  FreezeSave(const char *path);
 int  FreezeLoad(const char *path);
 
@@ -345,6 +335,7 @@ int iobuf_open_verified(void);
 // a long hold is left alone for the game. The menu thread does the rest.
 #define NOTE_TAP_US 400000   // <400ms press = a tap (open menu); longer = mute (ignore)
 extern volatile int g_menu_open;    // 1 while the browser is up (blocks re-trigger)
+extern volatile int g_st_op_hold;   // 1 for a whole save/load op: holds the gamma correction off (see fatsave.c)
 extern SceUID g_menu_thid;          // the menu thread, woken on the open combo
 // Real sceController_Service Peek/Read, captured before sctrlHENPatchSyscall
 // redirects them to the *Patched wrappers (main.c). The wrappers call through these.
@@ -374,7 +365,7 @@ int ProcessSignals(int ev_id, char *ev_name, void *param, int *result);
 // the boot version banner and failure/ABORT lines) go through the SAME MS gate
 // (ms_write_line() checks DBG_MS() itself) — "Raw" only means they always
 // mirror to UART regardless of DBG_MS(), not that they bypass the MS file.
-// A release build (DEBUG_BUILD 0) turns all four into no-ops at the call site.
+// A release build (DEBUG_BUILD 0) turns all five into no-ops at the call site.
 #if DEBUG_BUILD
 void WriteDebugLog(const char* msg);
 void WriteDebugLogHex(const char* prefix, u32 val);

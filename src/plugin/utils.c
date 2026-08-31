@@ -1,7 +1,3 @@
-// PspStates for PSP (32MB)
-// Home-menu streaming — simplified utils
-
-// header
 #include "pspfatsave.h"
 #include <stdarg.h>   // WriteDebugLogRawF (DEBUG only)
 
@@ -34,7 +30,6 @@ void ClearCaches(void)
 }
 
 // Drain PL080 DMA channels; returns 0 if fully drained, nonzero if timeout.
-// Fixes infinite hardware stall from in-flight transfer to same DRAM bank.
 static u32 dmac_drain_wait(void)
 {
 	volatile u32 *en0 = (volatile u32 *)(0xBC900000 + 0x1C);
@@ -114,10 +109,27 @@ void WriteDebugLogRawF(const char *fmt, ...)
 	ms_write_line(buf);
 	if (DBG_UART()) uart_puts(buf);
 }
+#else
+// RELEASE-ONLY vsnprintf stub. Not code we run — a link-order fix: in a debug
+// build WriteDebugLogRawF (above) references vsnprintf, so the linker pulls
+// libc's vsnprintf.o when it scans -lc (early on the link line). In a release
+// build ALL our vsnprintf references compile out, so -lc loads nothing — and
+// later, -lpspdebug (appended by build_prx.mak) drags in libpspdebug's
+// pspDebugScreenPrintf.o via the never-executed screen fallback inside
+// exception.o (see the Makefile's -lpspge note), which wants vsnprintf after
+// -lc has already been scanned -> "undefined reference to vsnprintf". The only
+// consumer of this stub is that dead SDK path; if it ever DID run it would
+// just format an empty string (returns 0 = "nothing written"), never crash.
+int vsnprintf(char *s, size_t n, const char *fmt, __builtin_va_list ap);
+int vsnprintf(char *s, size_t n, const char *fmt, __builtin_va_list ap)
+{
+	(void)s; (void)n; (void)fmt; (void)ap;
+	return 0;
+}
 #endif
 
 // Find driver entry by name; allows df_init/df_exit in-place without sceIoDelDrv.
-// Fixes Dissidia freeze from open flash0: handle kill. k1 must be elevated by caller.
+// k1 must be elevated by caller.
 static PspIoDrvArg *find_io_driver_entry(const char *name)
 {
 	u32 deldrv, lookup = 0, a;
@@ -156,9 +168,12 @@ static void io_driver_init(PspIoDrvArg *e, const char *tag)
 // System event handler: arm RTC alarm on POWER_LOCK; handle RESUME_COMPLETED cleanup.
 int ProcessSignals(int ev_id, char *ev_name, void *param, int *result)
 {
-	// Do NOT log on every sysevent; even UART logging wedges the suspend handshake.
-	// Only [M9]/[M10] markers are safe.
+	// Do not log on every sysevent; only the [M9]/[M10] markers are written here.
 	(void)ev_name; (void)param; (void)result;
+	// Screen-tuning power coordination — stand the gamma pass down during the
+	// suspend-descent phases ((ev_id & 0xFF00) == 0x4000); see screen_tuning.c.
+	if((ev_id & 0xFF00) == 0x4000)
+		st_pwr_suspend();
 	if(ev_id == PSP_SYSEVENT_KERNEL_POWER_LOCK_PHASE1)
 	{
 		if(g_sleep_arm == 1)
@@ -166,8 +181,6 @@ int ProcessSignals(int ev_id, char *ev_name, void *param, int *result)
 			u64 tick;
 			sceRtcGetCurrentTick(&tick);
 			// Auto-wake delay. RTC tick unit is 1us, so +100ms = +100000 ticks.
-			// (Was +2s "optimized for firmware descent timing" — if the descent
-			// isn't complete when this fires, the wake can miss or hang; watch it.)
 			tick += 100000ULL;   // 100 ms
 			sceRtcSetAlarmTick(&tick);
 			g_sleep_arm = 2; // armed
@@ -179,12 +192,9 @@ int ProcessSignals(int ev_id, char *ev_name, void *param, int *result)
 		if(g_sleep_mode == 9)
 		{
 			// Capture kernel to game-RAM staging (cached, not uncached-alias).
-			// Poll thread drains to MS post-resume and restores game RAM.
-			// Drain DMAC first to avoid hardware stall from in-flight transfer.
 #if DEBUG_BUILD
 			if (DBG_UART()) uart_puts("[M9] enter (SAVE kernel capture)");
 #endif
-			// Poll thread logs residual drain bits post-resume.
 			g_dma_drain_left = dmac_drain_wait();
 #if DEBUG_BUILD
 			if (DBG_UART()) uart_log_hex("[M9] drain_left=", g_dma_drain_left);
@@ -198,9 +208,8 @@ int ProcessSignals(int ev_id, char *ev_name, void *param, int *result)
 		}
 		else if(g_sleep_mode == 10)
 		{
-			// Apply snapshot via ApplyHandoff blob (runs from game RAM).
-			// Restores SAVE-TIME dispatcher context and jumps; LOAD session abandoned.
-			// Drain DMAC first to avoid hardware stall.
+			// Apply snapshot via ApplyHandoff blob (runs from game RAM); restores
+			// SAVE-TIME dispatcher context and jumps; LOAD session abandoned.
 #if DEBUG_BUILD
 			if (DBG_UART()) uart_puts("[M10] enter (LOAD handoff)");
 #endif
@@ -226,14 +235,15 @@ int ProcessSignals(int ev_id, char *ev_name, void *param, int *result)
 	else if(ev_id == PSP_SYSEVENT_RESUME_COMPLETED)
 	{
 		state_flag = 0;
+		// Arm the delayed gamma re-enable (see st_pwr_resume).
+		st_pwr_resume();
 		// Clear alarm; prevents immediate wake on next native sleep.
 		sceRtcSetAlarmTick(NULL);
 		g_sleep_arm = 0;
-		// Clear mode/handoff; stale values would cause kernel clobber on next native sleep.
+		// Clear mode/handoff.
 		g_sleep_mode = 0;
 		g_handoff_ctx_addr = 0;
-		// Flash repair: rebuild drivers to fix stale state on LOAD and Pirates freeze on SAVE.
-		// Unassign/re-assign leaks ~22-30KB RAM per cycle; gate to LOAD only (SAVE already mounted).
+		// Rebuild flash drivers on LOAD (in-place df_exit/df_init).
 		{
 			int r;
 			u32 k1;
@@ -251,9 +261,9 @@ int ProcessSignals(int ev_id, char *ev_name, void *param, int *result)
 			ff = find_io_driver_entry("flashfat");
 			uart_log_hex("[LFL] lflash entry=", (u32)lf);
 			uart_log_hex("[LFL] flashfat entry=", (u32)ff);
-			io_driver_exit(lf, "[LFL] lflash");     // driver rebuild (both ops): in-place df_exit
-			io_driver_exit(ff, "[LFL] flashfat");   //   then df_init, so the driver ENTRY stays
-			io_driver_init(lf, "[LFL] lflash");     //   (no do_deldrv handle-kill).
+			io_driver_exit(lf, "[LFL] lflash");     // in-place df_exit/df_init so the
+			io_driver_exit(ff, "[LFL] flashfat");   // driver ENTRY stays (no handle-kill).
+			io_driver_init(lf, "[LFL] lflash");
 			io_driver_init(ff, "[LFL] flashfat");
 			pspSdkSetK1(k1);
 			if (is_load) {
@@ -263,7 +273,7 @@ int ProcessSignals(int ev_id, char *ev_name, void *param, int *result)
 				uart_log_hex("[FLASH1] assign flash1=", (u32)r);
 			}
 		}
-		// Re-apply overclock; firmware suspend/resume reverts PLL registers to stock.
+		// Re-apply overclock after resume.
 		if (g_overclock_id > 0) oc_apply(g_overclock_id);
 		g_resumed = 1; // wait_for_resume() polls this to detect the firmware resume
 	}

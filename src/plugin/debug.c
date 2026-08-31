@@ -13,21 +13,14 @@
 // per test function). Reset to 4 at the start of each top-level test
 // function, right after dbg_capture_both_bufs().
 int ms_test_row = 0;
-// When set, the menu-open path skips ALL its Memory-Stick debug writes. Those writes
-// are not just slow — the pad hook's WriteDebugLog runs on the GAME thread and parks it
-// inside an MS I/O (holding the FATMS lock) right as we suspend it, which deadlocks the
-// next log write. Save/load leave this 0 so their diagnostics are untouched.
+// When set, the menu-open path skips ALL its Memory-Stick debug writes.
+// Save/load leave this 0 so their diagnostics are untouched.
 int g_menu_quiet = 0;
 
 #if DEBUG_BUILD
-// Gate-log RAM buffer: a MENU freeze must do ZERO MS I/O between the first thread
-// suspend and the MS probe — the fast gate can freeze a game thread in READY while
-// it's INSIDE the FAT driver holding its lock, and the next [SUS] log append then
-// deadlocks on that lock before the probe can detect it and retry (observed: menu
-// open on GTA, last line "[PRE] threadmain st=0x2", hard freeze). With the Debug MS
-// bit on, [PRE]/[SUS] lines from quiet (menu) freezes are buffered here and flushed
-// by run_save_browser only AFTER the probe confirms the MS is usable (or after the
-// game is resumed on abort).
+// Gate-log RAM buffer: buffers [PRE]/[SUS] lines from quiet (menu) freezes so the
+// menu freeze does no MS I/O; flushed once the MS probe confirms the MS is usable
+// (or after the game is resumed on abort).
 static char g_gatelog[4096];
 static int  g_gatelog_len = 0;
 void gatelog_line(const char *line)
@@ -67,19 +60,11 @@ static int label_has_fail(const char *label)
 	return 0;
 }
 
-// ── Non-intrusive per-checkpoint timing trace ──
-// Two sinks, chosen by the Debug setting:
-//   - UART on (DBG_UART): trace_record emits the line LIVE to the UART FIFO
-//     immediately (register-only, a few µs — does NOT distort the timed window
-//     the way an MS open/append/close per line would). Each line already carries
-//     the logger's own [+µs] anchor prefix, so timing survives; and a mid-save
-//     hang leaves the last checkpoint on the wire (better hang-localization than
-//     a burst-after-the-fact). No RAM buffer, so NO 96-entry truncation on the
-//     wire — the concern that motivated this change.
-//   - UART off but MS on (DBG_MS): fall back to the old behavior — buffer
-//     {elapsed-µs, cp, retval, label} into a small RAM array (no sceIo per line
-//     in the frozen window) and dump it in ONE burst at trace_flush() AFTER the
-//     timed section. This keeps crash-safe MS timing without per-line MS I/O.
+// ── Per-checkpoint timing trace, two sinks chosen by the Debug setting ──
+//   - UART on (DBG_UART): trace_record emits each line LIVE to the UART FIFO
+//     immediately (register-only, no buffering).
+//   - UART off, MS on (DBG_MS): buffer {elapsed-µs, cp, retval, label} in RAM and
+//     dump in ONE burst at trace_flush() after the timed section.
 // trace_start/record/flush are independent of DBG_SCR.
 u64 now_us(void);   // defined below; used by the trace functions here
 #define TRACE_CAP 64
@@ -145,18 +130,13 @@ void ms_test_cp(u32 cp, u32 retval, const char *label)
 	char buf[80];
 	int fail;
 	if (g_menu_quiet) return;          // menu open: no per-checkpoint MS write/pause
-	// Feed the MS-burst trace buffer. Skip when UART is on: this function already
-	// emits the CP line live to UART below, and trace_record would ALSO emit it
-	// live on the UART path -> a duplicate wire line. (The IOBUF-flush records at
-	// CP60/62/63 call trace_record directly, not through here, so they still reach
-	// the live UART trace.)
+	// Feed the MS-burst trace buffer (skip on UART: this function already emits
+	// the line live to UART below, so trace_record would duplicate it).
 	if (!DBG_UART()) trace_record(cp, retval, label);
 
 	// Routed by the Debug setting (see pspfatsave.h): bit0 = MS log, bit1 =
-	// screen. FAILURE checkpoints still get a chance to reach UART below even
-	// with MS/Screen off (rare, and a live UART capture needs the last reached
-	// step) — but the MS file itself stays gated on DBG_MS(), no exceptions
-	// (ms_write_line() enforces this regardless of what calls it).
+	// screen. Failure checkpoints can still reach UART below even with MS/Screen
+	// off, but the MS file stays gated on DBG_MS() (ms_write_line() enforces this).
 	fail = label_has_fail(label);
 	// UART is an independent sink: emit if UART logging is on, even when MS and
 	// Screen are both off.
@@ -172,15 +152,10 @@ void ms_test_cp(u32 cp, u32 retval, const char *label)
 		dbg_print_all(buf);
 	}
 
-	// Crash-safe logging: write EACH checkpoint straight to the MS log
-	// immediately (open/append/close per line) — plain sceIo* works under
-	// the partial freeze used here, and with DBG_MS() on, a post-power-cycle
-	// read of the file shows exactly the last reached step. WriteDebugLogRaw
-	// also mirrors to UART (when DBG_UART) — so only emit UART separately
-	// when the raw path is NOT taken, to avoid a double UART line. (When MS
-	// is off, the "fail" branch below still calls WriteDebugLogRaw so a
-	// failure reaches UART if that's on; ms_write_line() itself is what
-	// keeps the MS file untouched while DBG_MS() is off, not this check.)
+	// Crash-safe: write each checkpoint straight to the MS log immediately
+	// (open/append/close per line), so a post-power-cycle read shows the last
+	// reached step. WriteDebugLogRaw also mirrors to UART (when DBG_UART), so
+	// only emit UART separately when the raw path is not taken.
 	if (DBG_MS() || fail)
 		WriteDebugLogRaw(buf);          // MS write only if DBG_MS() (+ UART if on)
 	else if (DBG_UART())
@@ -188,13 +163,7 @@ void ms_test_cp(u32 cp, u32 retval, const char *label)
 }
 // Per-op profile: volatile lock word (0x880E59C0) + DMAC channel-enable (in-flight
 // game DMA). Both are plain MMIO reads that can NEVER fault — safe pre-freeze,
-// frozen, and post-resume.
-// NOTE: the volatile-region CONTENT fingerprint (CPU-reading 0x88400000) was REMOVED
-// — it CRASHED a Pirates save (v485): a CPU read of the volatile region while the
-// DDR-MPU has it locked faults (kernel exception), and the lock word is NOT a reliable
-// proxy for MPU state, so there is no safe pre-check. vlock already tells us the lock
-// state (the key GTA-vs-others signal); the content hash was only a nice-to-have.
-// (with_vcrc kept as a no-op parameter so call sites/macros don't churn.)
+// frozen, and post-resume. with_vcrc is kept as a no-op parameter.
 void diag_profile_ex(const char *phase, int with_vcrc)
 {
 	u32 en0, en1, lockw;
@@ -208,9 +177,7 @@ void diag_profile_ex(const char *phase, int with_vcrc)
 	uart_puts(b);
 }
 
-// Dump every game thread's name/status/waitType/waitId over UART — the per-op
-// thread profile for comparing a failing game's thread set + wait states against
-// GTA's. UART-only, register reads (sceKernelReferThreadStatus is safe frozen).
+// Dump every game thread's name/status/waitType/waitId over UART.
 void diag_threads(const char *phase, const SceUID *tids, int tcount)
 {
 	int t;
@@ -222,9 +189,6 @@ void diag_threads(const char *phase, const SceUID *tids, int tcount)
 		if (sceKernelReferThreadStatus(tids[t], &ti) < 0)
 			sprintf(b, "[THR:%s] tid%d refer-FAILED", phase, t);
 		else
-			// (A frozen ME-RPC mutex holder is NOT identifiable from this dump —
-			// it can be suspended READY inside the RPC with wt=0 wid=0, observed
-			// on Duodecim. me_rpc_probe reports the owner directly instead.)
 			sprintf(b, "[THR:%s] %.14s st=0x%X wt=0x%X wid=0x%X pri=%d",
 			        phase, ti.name, (unsigned)ti.status, (unsigned)ti.waitType,
 			        (unsigned)ti.waitId, ti.currentPriority);

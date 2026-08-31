@@ -74,9 +74,6 @@
 #endif
 #endif
 
-/*
- * FIXME: use preprocessor magic to set this on different platforms!
- */
 typedef unsigned char  flzuint8;
 typedef unsigned short flzuint16;
 typedef unsigned int   flzuint32;

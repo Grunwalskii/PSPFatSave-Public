@@ -8,46 +8,11 @@
 #include "fatsave.h"
 
 // ── Intro Video Skip (PER-GAME, gameset.cfg) ───────────────────────────────
-// Games play their own intro/publisher-logo reels; the Sony boot logo is the XMB's
-// game_plugin_module animation and is CFW's business, NOT this (ARK patches it in
-// core/compat/psp/syspatch.c). Games reach video by one of two paths, and the v656
-// probe found one real game of each shape, so BOTH are handled:
-//
-//   scePsmfPlayer — the high-level "play this PMF" API. Game-bundled PRX (see below).
+// Skips game intro videos by one of two paths:
+//   scePsmfPlayer — the game-bundled "play this PMF" API.
 //                   Skip = force GetCurrentStatus to report PLAYING_FINISHED.
-//                   CONFIRMED WORKING on hardware (v658, Pirates): instant and clean.
-//   sceMpeg       — the low-level decode API (firmware, flash0:/kd/mpeg.prx,
-//                   "sceMpeg_library"), normally paired with scePsmf_library as the
-//                   demuxer plus the game's own decode loop.
+//   sceMpeg       — the low-level decode API (firmware "sceMpeg_library").
 //                   Skip = pulse the game's OWN skip button while a video is loaded.
-//
-// Measured (v656/v658 probe, UART):
-//   Tron    — sceMpeg_library + scePsmf_library, NO player at all. Note scePsmf_library
-//             is the DEMUXER; the player is scePsmfP_library ('P'), which is why the
-//             five-name list correctly does not match it. Imports 25 sceMpeg functions
-//             including both AU getters.
-//   Pirates — sceMpeg_library + scePsmf_library + scePsmfP_library, GetCurrentStatus
-//             resolved at 0x09E53BFC. Has the player.
-//
-// MEASURED RESULT (v659, Tron, reproduced 2/2): the intro movie is GONE 304ms after
-// injection starts, against a natural length of >=15s. The Disney logo that follows
-// ignores START+X for its whole ~6.0s and plays out; that 6s is the floor and is all
-// that remains of the intro. See the "BUTTONS ARE THE ONLY LEVER" block below for the
-// three builds that tried to force such a video and why none of them survived.
-//
-// A game with BOTH (Pirates) gets the PLAYER treatment and no injection: the player is
-// the precise lever, it is confirmed, and it is instant.
-//
-// scePsmfPlayer is NOT firmware: absent from both psplibdoc_660.xml and the 1.50 doc,
-// and PPSSPP HLE-replaces it under five GAME-BUNDLED module names (sceKernelModule.cpp:
-// 1580). It ships on the UMD, its name varies per game, and it does not exist until the
-// game loads it — hence the probe rather than a fixed lookup at boot. sceMpeg is the
-// opposite: firmware, so its module name is the same for every game — which is what
-// makes it usable as a "a video is on screen right now" flag.
-//
-// Injection cannot beat a game's own lockout (Tron's logo gates skips for ~5s), so this
-// shortens an intro rather than removing it. That is the trade for using the game's
-// intended path: no black frames, no faked state, and a wrong guess just does nothing.
 #define PSMF_PLAYER_STATUS_PLAYING_FINISHED 0x200
 #define PSMF_GET_CURRENT_STATUS_NID         0xF8EF08A6
 #define MPEG_GET_AVC_AU_NID                 0xFE246728
@@ -58,91 +23,36 @@
 #define VSKIP_OP_JR_RA 0x03E00008u
 #define VSKIP_OP_LI_V0 (0x24020000u | PSMF_PLAYER_STATUS_PLAYING_FINISHED)
 
-// CREATE-FAIL, an EXPERIMENT distinct from the abandoned EOF stub (see below). Instead of
-// faking end-of-stream mid-playback, make sceMpegCreate itself fail up front with
-// SCE_MPEG_ERROR_OUT_OF_MEMORY (0x80610022, uofw lib_mpeg.h; PPSSPP sceMpeg.cpp:497 is
-// its NO_MEMORY return). The reasoning that makes it worth trying where the stub failed:
-// video INIT failing is a real runtime condition a game must cope with (low memory,
-// bad disc), so a game plausibly has a tested "create failed -> skip the video" branch,
-// where it had no branch at all for "stream ended on the first frame". 3-word entry
-// patch: lui v0,0x8061 / jr ra / ori v0,v0,0x22 (the ori is the delay slot). If the game
-// wedges instead of skipping, this is as dead as the stub and injection-only is the ship.
+// Patch sceMpegCreate's entry so it fails up front with SCE_MPEG_ERROR_OUT_OF_MEMORY
+// (0x80610022). 3-word entry patch: lui v0,0x8061 / jr ra / ori v0,v0,0x22 (the ori is
+// the delay slot).
 #define MPEG_CREATE_OP0 0x3C028061u   // lui v0, 0x8061
 #define MPEG_CREATE_OP1 0x03E00008u   // jr  ra
 #define MPEG_CREATE_OP2 0x34420022u   // ori v0, v0, 0x22   (delay slot) -> v0 = 0x80610022
 
-// ── THE LEARNED TIME WINDOW (v666) ────────────────────────────────────────────
-// Every automatic "is a video playing" signal was tried and every one failed, in
-// OPPOSITE directions, because "codec loaded" is simply not the same event as "video
-// on screen":
-//   Field Commander - keeps sceMpeg_library RESIDENT into its menu, so the presence gate
-//                     stayed true and pulsed START+X into the menu, reaching a save
-//                     dialog 6.75s in (v663). Capped at 2s (v664) - a guess.
-//   Valkyria Chr. II - loads the codec at boot INIT and plays its video much later. The
-//                     presence gate armed at the load, the 2s cap shut the window at
-//                     +2.1s, and create-fail was RESTORED at stand-down - so when the
-//                     video actually ran, nothing was armed at all (v665).
-//   Tomb Raider: Ann - no sceMpeg at ALL (decodes via sceVideocodec directly), so the
-//                     gate never fires. avcodec never drops either (v665 measured it).
-// There is no signal that separates an intro video from a menu/gameplay video - they are
-// the same thing technically. So stop guessing and ASK THE USER once, per game:
-//
-//   CAPTURE run - ARMED at boot by boot_frozen_prompts: the game is frozen, the banner
-//                 "Hold RIGHT until Intro skipped" is shown, and the user holds D-pad Right
-//                 (VSKIP_HOLD_BTN) for 1s. The game then resumes with Right already held, so
-//                 there is NO forced window — the skip fires strictly while Right is held
-//                 (this is what stops a psmf-patch game from skipping its intro before the
-//                 user can react). Right is deliberately NOT an injected button, so the
-//                 injector can pulse a clean X/START. When the user RELEASES Right, the
-//                 elapsed time minus VSKIP_REACTION_MS (their reaction lag) is the learned
-//                 window, saved per game; the setting flips to VSKIP_TIMED.
+// ── THE LEARNED TIME WINDOW ────────────────────────────────────────────────
+// The skip window is not detected automatically; it is LEARNED per game from the user.
+//   CAPTURE run - armed at boot: the user holds D-pad Right (VSKIP_HOLD_BTN) for the
+//                 whole intro. Firing happens strictly while Right is held; when the
+//                 user RELEASES it, elapsed minus VSKIP_REACTION_MS (their reaction lag)
+//                 is the learned window, saved per game, and the setting flips to TIMED.
 //   TIMED runs  - fire everything from the anchor for the learned ms. No detector, no arm.
 //
-// The anchor is this thread's start (the game's first controller read; for CAPTURE, right
-// after the arm resume), which is stable per game. Path-agnostic by construction: a timer
-// does not care whether a game uses psmf, sceMpeg, a resident codec, or sceVideocodec
-// directly - which is exactly why it covers the games no signal could.
+// The anchor is this thread's start (the game's first controller read), stable per game.
 #define VSKIP_REACTION_MS 500                 // capture: trimmed off (hold btn released AFTER the intro ends)
 
 // Buttons pulsed into the game's own controller reads while the window is open. Pulsed
-// ALTERNATELY, one at a time, never together (see vskip_phase_mask) - simultaneous START+X
-// broke Tron's confirmation screen where X-alone works.
+// ALTERNATELY, one at a time, never together (see vskip_phase_mask).
 #define VSKIP_INJECT_MASK  (PSP_CTRL_START | PSP_CTRL_CROSS)
 // Press/release cadence is WALL-CLOCK, not call-count: X held for VSKIP_PULSE_US, released
-// for the same, phase derived from sceKernelGetSystemTimeLow(). A call-count tick assumed
-// one read per frame and broke on any loop that polls at a different rate (a confirmation
-// screen reading the pad on its own loop could land every sample in the release half and
-// never see a press). Time-based, every reader at the same instant sees the same held state.
+// for the same, phase derived from sceKernelGetSystemTimeLow(), so every reader at the
+// same instant sees the same held state.
 #define VSKIP_PULSE_US 120000                  // 120ms held, then 120ms released
 #define VSKIP_POLL_US      100000              // watcher poll period
 // The button the USER holds to drive CAPTURE (the arm gate + the fire window). Deliberately
-// NOT one of the injected buttons (VSKIP_INJECT_MASK): X used to be both, which forced the
-// injector to "own"/mask the user's held X and left the game seeing a muddied X — a final
-// "press X/START" prompt after Tron's videos never registered. D-pad Right is unused during
-// an intro, so the injector can pulse a CLEAN X/START while the user holds Right.
-// SCEMPEG LEVERS FOR A PLAYER-LESS GAME. Two are live: button injection (confirmed on
-// Tron) and, as of v663, the create-fail experiment above. What is ABANDONED and must NOT
-// be revived without new evidence is the end-of-stream stub - a different thing from
-// create-fail (it fakes EOF mid-playback; create-fail refuses the video up front):
-//   v657/v658  Overwriting sceMpegGetAvcAu/GetAtracAu with an end-of-stream stub (dts =
-//              -1 + 0x80618001, what the real functions do at EOF). Killed the picture
-//              but not the wait: Tron's first video became a BLACK SCREEN needing a
-//              manual X. Also inconsistent run to run - no effect in v657, clear effect
-//              in v658, with only logging changed between them. Never explained.
-//   v660       Same stub as an escalation for a video that ignores the button, aimed at
-//              Tron's Disney logo. Far worse: the logo went from a clean 6.0s to 34.2s of
-//              black that needed a CONSOLE SUSPEND to escape.
-// The pattern across BOTH stub attempts: killing the decode removes the picture and leaves
-// whatever the game is actually waiting on untouched, or wedges it. A video that refuses
-// the skip button is refusing deliberately, and we have no honest way to satisfy its
-// gate. Tron's Disney logo is unskippable with every lever we have - v659 pulsed START+X
-// across its entire 6s and it ignored them - and that 6s is the floor.
-// (v660 was also mistuned to 100ms, below the 304ms video 1 needs to button-skip, so it
-// stubbed the one video that already worked. That was a separate bug and fixing it to 1s
-// would not have saved the logo.)
-// Outer safety bound on the watcher thread. The learned window (or the user releasing X)
-// is what actually ends it; this only guarantees the thread always exits, e.g. if a
-// capture run is left with X never pressed.
+// NOT one of the injected buttons (VSKIP_INJECT_MASK) so the injector can pulse a clean
+// X/START while the user holds Right.
+// Outer safety bound: guarantees the watcher thread always exits.
 #define VSKIP_CAP_US (120 * 1000 * 1000)
 
 int g_video_skip = VSKIP_OFF;              // PER-GAME (gameset.cfg word 4): OFF / CAPTURE / TIMED
@@ -165,17 +75,13 @@ static u32  g_mpeg_create_fn = 0;          // sceMpegCreate (USER addr) of the C
 static u32  g_mpeg_create_save[3];         // the three instructions the create-fail patch overwrote
 static int  g_mpeg_create_patched = 0;
 
-// The CAPTURE banner is drawn by fps_poll_thread (the same path the FPS overlay uses to
-// reach games that never call sceDisplaySetFrameBuf during play, e.g. GTA/Pirates), so the
-// watcher has to spin that thread up. Defined far below; forward-declared here.
+// The CAPTURE banner is drawn by fps_poll_thread, so the watcher has to spin that thread
+// up. Defined far below; forward-declared here.
 void fps_poll_ensure_started(void);
 
-// Kernel PRX .bss is NOT zeroed at load, and every zero initializer above lands there.
-// g_psmf_status_fn matters most: video_skip_probe only ever WRITES it, so on a game with
-// no player the watcher would read boot garbage, pass the != 0 test and patch a wild
-// address. g_vskip_inject matters too — it is read by the controller hooks on EVERY
-// frame from the very first one, long before the watcher exists. Called from
-// module_start with the rest of the BSS init.
+// Kernel PRX .bss is NOT zeroed at load, so the globals above must be reset here
+// (g_psmf_status_fn and g_vskip_inject are read before the watcher writes them). Called
+// from module_start with the rest of the BSS init.
 void video_skip_init(void)
 {
 	g_video_skip = VSKIP_OFF;
@@ -194,8 +100,8 @@ void video_skip_init(void)
 	g_mpeg_create_patched = 0;
 }
 
-// Overwrite sceMpegCreate's entry so it fails with OUT_OF_MEMORY (see the CREATE-FAIL
-// note above). g_mpeg_create_fn must already point at the current codec's export.
+// Overwrite sceMpegCreate's entry so it fails with OUT_OF_MEMORY.
+// g_mpeg_create_fn must already point at the current codec's export.
 static void vskip_create_patch(void)
 {
 	u32 a = g_mpeg_create_fn;
@@ -210,9 +116,8 @@ static void vskip_create_patch(void)
 	g_mpeg_create_patched = 1;
 }
 
-// Restore sceMpegCreate. Guarded like every other revert here: the codec unloads between
-// videos and a reload lands at the same address with its own code, so only write back if
-// OUR three words are still present AND the address still belongs to sceMpeg_library.
+// Restore sceMpegCreate: only write back if OUR three words are still present AND the
+// address still belongs to sceMpeg_library.
 static void vskip_create_restore(void)
 {
 	u32 a = g_mpeg_create_fn;
@@ -242,26 +147,16 @@ void video_skip_probe(SceModule2 *module)
 	// use" as fact instead of by assumption.
 	static const char *dump_libs[3] = { "sceMpeg", "sceMpegbase", "scePsmf" };
 	int i;
-	// Only LOG when Intro Video Skip is actually enabled for this game: with the feature
-	// OFF the probe's module dump is pure noise (a game keeps loading sceChnnlsv/
-	// sceVshSDAuto etc. for its whole run). The functional detection below still runs
-	// unconditionally, so a CAPTURE/TIMED game that hasn't had its setting loaded yet at an
-	// early psmf-player load is not missed. NOTE: on a release build DBG_UART() is 0 anyway.
+	// Only LOG when Intro Video Skip is enabled for this game; with it OFF the module dump
+	// is noise. The functional detection below still runs unconditionally. On a release
+	// build DBG_UART() is 0 anyway.
 	int vlog = (DBG_UART() && g_video_skip != VSKIP_OFF);
 	if (module == NULL) return;
-	// The probe half of this feature: with UART on, every module the game loads is
-	// named on the wire. That is how we find out what a given game actually ships —
-	// the five names above are PPSSPP's list, not an exhaustive one.
+	// With UART on, name every module the game loads on the wire.
 	if (vlog) { char b[80]; sprintf(b, "[VSKIP] mod %s", module->modname); uart_puts(b); }
 
-	// v657 armed the end-of-stream stub across the whole of Tron's first video and the
-	// game played it through regardless (15.5s, then straight on to video 2) — which
-	// only adds up if the AU getters are never called, i.e. Tron reaches video by some
-	// other entry point. So stop guessing which one and read it out of the module's own
-	// import table. The NID list lives in the module image, so it is readable right
-	// here, before the loader has even resolved the stubs, and needs nothing armed.
-	// Costs nothing on a release build (DBG_UART() is 0) and nothing on modules that
-	// import none of these libraries.
+	// Read the module's own import table (the NID list lives in the module image) to see
+	// which entry points this game actually uses.
 	if (vlog) {
 		for (i = 0; i < 3; i++) {
 			SceLibraryStubTable *imp = sctrlFindImportLib(module, (char *)dump_libs[i]);
@@ -283,9 +178,8 @@ void video_skip_probe(SceModule2 *module)
 	}
 	for (i = 0; i < 5; i++) {
 		if (strcmp(module->modname, psmf_mods[i]) != 0) continue;
-		// Exports are registered at load time, so the export walk resolves here even
-		// though module_start has not run yet. Latch only — the arming decision needs
-		// the per-game setting off the MS, which this thread must not touch.
+		// Latch only; the arming decision needs the per-game setting, which this thread
+		// must not touch.
 		g_psmf_status_fn = sctrlHENFindFunction(module->modname, "scePsmfPlayer",
 		                                        PSMF_GET_CURRENT_STATUS_NID);
 		strncpy(g_psmf_modname, module->modname, sizeof(g_psmf_modname) - 1);
@@ -296,19 +190,15 @@ void video_skip_probe(SceModule2 *module)
 			        module->modname, (unsigned)g_psmf_status_fn);
 			uart_puts(b);
 		}
-		// This game has a player, which is the confirmed lever - so undo any create-fail
-		// patch we may have applied for an earlier bare sceMpeg load and never apply it
-		// again (the sceMpeg branch below gates on !g_psmf_status_fn). This is what keeps
-		// create-fail from breaking a player that decodes through sceMpeg underneath, e.g.
-		// Pirates - its player loads AFTER sceMpeg but its own create calls come later.
+		// This game has a player, so undo any create-fail patch from an earlier bare
+		// sceMpeg load; the sceMpeg branch below gates on !g_psmf_status_fn.
 		vskip_create_restore();
 		return;
 	}
 	if (strcmp(module->modname, "sceMpeg_library") == 0) {
 		g_mpeg_load_seq++;
-		// Patch CREATE-FAIL here (probe hook) not watcher. Patch dies on unload; reset each load.
-		// Gate: window open AND no psmf player (player is better lever); window-gated outside learned
-		//   is an in-game cutscene and must be left alone.
+		// Patch CREATE-FAIL here, not in the watcher. Patch dies on unload; reset each load.
+		// Gate: window open AND no psmf player (the player is the better lever).
 		g_mpeg_create_patched = 0;
 		if (g_vskip_window && g_psmf_status_fn == 0) {
 			g_mpeg_create_fn = sctrlHENFindFunction(module->modname, "sceMpeg", MPEG_CREATE_NID);
@@ -326,13 +216,8 @@ void video_skip_probe(SceModule2 *module)
 // The ONE skip button to inject this instant, or 0 during a release gap. Wall-clock phase
 // (VSKIP_PULSE_US buckets): even bucket = a button held, odd = release gap; the next bit
 // alternates WHICH button. So the cadence is  X held / gap / START held / gap / repeat.
-//
-// The two buttons are pulsed ALTERNATELY, never together. Pressing START+X on the SAME frame
-// broke Tron's post-video confirmation screen: a human presses X alone and it advances, but
-// simultaneous START (which a Yes/No prompt can read as pause/cancel/selection-move) muddied
-// it so the X never confirmed. Alternating guarantees the prompt sees clean X-alone presses,
-// while a video that skips on START still gets clean START-alone presses. Each button fires
-// every 4th phase (~480ms) - ~20 presses of each inside a 10s window.
+// The two buttons are pulsed ALTERNATELY, never together. Each button fires every 4th
+// phase (~480ms).
 static u32 vskip_phase_mask(void)
 {
 	u32 bucket = sceKernelGetSystemTimeLow() / VSKIP_PULSE_US;
@@ -368,13 +253,10 @@ void vskip_inject_buttons(SceCtrlData *pad_data, int count, int res, int negativ
 	}
 }
 
-// Latch counterpart of vskip_inject_buttons. Some games read their skip input from the
-// controller LATCH (an edge accumulator: make/break/press/release bits) instead of the
-// button buffer — e.g. Ratchet & Clank — so the buffer injection above never reaches them
-// and X/START "don't register". A confirmation screen reads the MAKE edge ("just pressed"),
-// so assert make+press for the ONE button pulsed this instant (same alternating cadence as
-// the buffer path). We do NOT fake break/release: a spurious START-release could toggle a
-// pause menu. Same g_vskip_inject gate + wall-clock phase, so the two stay in lock-step.
+// Latch counterpart of vskip_inject_buttons for games that read the controller LATCH
+// (make/break/press/release edge bits) instead of the button buffer. Assert make+press
+// for the ONE button pulsed this instant (same alternating cadence as the buffer path);
+// do NOT fake break/release (a spurious START-release could toggle a pause menu).
 void vskip_inject_latch(SceCtrlLatch *latch)
 {
 	u32 mask;
@@ -403,10 +285,8 @@ static void vskip_unpatch(void)
 	u32 a = g_psmf_status_fn;
 	if (a == 0 || !g_vskip_patched) return;
 	g_vskip_patched = 0;
-	// Games unload the psmf module once the intro is done, so by now this address may
-	// be freed or re-used by something else — restoring blind would corrupt whatever
-	// took it over. Only write back if OUR two instructions are still there AND the
-	// address still belongs to the module we patched.
+	// Only write back if OUR two instructions are still there AND the address still
+	// belongs to the module we patched.
 	if (*(volatile u32 *)a == VSKIP_OP_JR_RA && *(volatile u32 *)(a + 4) == VSKIP_OP_LI_V0) {
 		SceModule2 *m = (SceModule2 *)sceKernelFindModuleByAddress(a);
 		if (m != NULL && strcmp(m->modname, g_psmf_modname) == 0) {
@@ -420,13 +300,9 @@ static void vskip_unpatch(void)
 	if (DBG_UART()) uart_puts("[VSKIP] window closed, module gone/changed - left alone");
 }
 
-// Persist the learned window to the RUNNING game's gameset.cfg. READ-MODIFY-WRITE, and
-// deliberately NOT save_game_settings(): that writes the g_autoload/g_compress/
-// g_frame_limit globals, which belong to whatever game the BROWSER last looked at, not
-// necessarily the running one — writing them here would copy another game's settings
-// onto this one. Only words 4/5 (our own) are touched; the rest are preserved as read.
-// Runs on the watcher (a kernel thread, MS-safe like the menu thread) at capture end,
-// which is after the intro when the game's boot streaming has settled.
+// Persist the learned window to the RUNNING game's gameset.cfg (READ-MODIFY-WRITE, not
+// save_game_settings(), which writes other games' globals). Only words 4/5 (our own) are
+// touched; the rest are preserved as read. Runs on the watcher at capture end.
 static void vskip_save_learned(void)
 {
 	char p[96], d[80]; SceUID fd; u32 buf[6]; int i;
@@ -469,13 +345,8 @@ int video_skip_thread(SceSize args, void *argp)
 	if (capture) fps_poll_ensure_started();   // banner is drawn by the poll thread (see vskip_banner_draw)
 
 	while ((now_us() - t0) < VSKIP_CAP_US) {
-		// DIAGNOSTIC ONLY, no behaviour change. sceAvcodec_wrapper is the decode layer
-		// UNDER sceMpeg, and games that bypass sceMpeg entirely (Tomb Raider: Anniversary
-		// uses sceVideocodec directly) still load it - so its load/UNLOAD could be a
-		// broader "video playing / intro over" signal than sceMpeg presence. The probe
-		// only sees loads; this polls presence so we can finally see whether a game DROPS
-		// it at the menu (usable stop signal) or keeps it resident (not usable). Logs the
-		// up/gone transitions; decides nothing.
+		// DIAGNOSTIC ONLY, no behaviour change: logs sceAvcodec_wrapper presence up/gone
+		// transitions; decides nothing.
 		{
 			int avc_now = (sceKernelFindModuleByName("sceAvcodec_wrapper") != NULL) ? 1 : 0;
 			if (avc_now != avc_present) {
@@ -489,28 +360,20 @@ int video_skip_thread(SceSize args, void *argp)
 			int fire;
 
 			if (capture) {
-				// Read the user's REAL hold button (VSKIP_HOLD_BTN = D-pad Right), not the
-				// game's pad: our own injection writes X/START into the game's buffer, and the
-				// hold button is deliberately a DIFFERENT button so the two never collide.
-				// kpeek is the kernel-mode (unmasked) hardware read the NOTE-tap detector
-				// already uses, so it only ever sees what the user is physically holding.
+				// Read the user's hold button (VSKIP_HOLD_BTN = D-pad Right) via kpeek
+				// (kernel-mode read), not the game's pad, so it only sees what the user is
+				// physically holding.
 				SceCtrlData kpad;
 				int x_held;
 				int k1 = pspSdkSetK1(0);
 				x_held = (kpeek(&kpad) > 0 && (kpad.Buttons & VSKIP_HOLD_BTN)) ? 1 : 0;
 				pspSdkSetK1(k1);
 
-				// No forced window: the capture is ARMED by the boot Hold gate
-				// (boot_frozen_prompts), so the user is already holding Right as the intro's
-				// first frame plays. Fire strictly while Right is held — releasing = "the intro
-				// ended here". This is what stops a psmf-patch game (Pirates) from skipping
-				// the intro before the user can react.
+				// Fire strictly while Right is held — releasing = "the intro ended here".
 				fire = x_held;
 				if (x_held) x_was_held = 1;
 
-				// Armed but Right let go before the thread's first read of it (released right
-				// after the 1s arm): nothing to time -> stand down rather than spin the full
-				// VSKIP_CAP_US. ~2s grace covers the resume -> thread-start -> first-poll gap.
+				// Right let go before the thread's first read: nothing to time, so stand down.
 				if (!x_was_held && elapsed >= 2000000) {
 					if (DBG_UART()) uart_puts("[VSKIP] hold button not held after arm - capture cancelled");
 					break;
@@ -544,11 +407,9 @@ int video_skip_thread(SceSize args, void *argp)
 				}
 			}
 
-			// "Fire everything" for the window: the psmf player patch where a game has one
-			// (Pirates - precise and instant), plus button injection and create-fail for
-			// everyone else. create-fail is driven from HERE, not only from the probe,
-			// because a resident codec (VC2) loads at boot init and creates its video much
-			// later - it has to be patched for the whole window, not just at load.
+			// "Fire everything" for the window: psmf player patch where a game has one, plus
+			// button injection and create-fail for everyone else. create-fail is also driven
+			// here because a resident codec can create its video mid-window, not just at load.
 			g_vskip_window = fire;   // the probe create-fails a codec that loads mid-window
 			if (fire) {
 				if (g_psmf_status_fn != 0 && !g_vskip_patched) {
@@ -607,11 +468,9 @@ void game_video_skip_load(void)
 	}
 	sceIoClose(fd);
 }
-// Intro-skip CAPTURE banner. Same draw mechanic as fps_draw (into the live buffer), and
-// called from the SAME two places — the SetFrameBuf hook AND fps_poll_thread — so it reaches
-// games that never call sceDisplaySetFrameBuf during play (GTA/Pirates), exactly like the
-// FPS overlay. Opaque band so it stays readable over a bright video. Own flag (g_vskip_banner):
-// one test per draw when off.
+// Intro-skip CAPTURE banner, drawn into the live buffer like fps_draw from the same two
+// places (SetFrameBuf hook and fps_poll_thread). Opaque band so it stays readable over a
+// bright video.
 void vskip_banner_draw(void *topaddr, int bufferwidth, int pixelformat)
 {
 	static const char *msg = "> SKIP INTRO - HOLD RIGHT";

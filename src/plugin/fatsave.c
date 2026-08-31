@@ -13,6 +13,13 @@ int state_flag = 0;			// 0x2F50
 
 // Save browser: the open combo (hook) sets g_menu_open + wakes the menu thread.
 volatile int g_menu_open = 0;
+// Held =1 for the DURATION of a save/load op: set by the browser's save/load trigger
+// (menu.c), it keeps the gamma correction off across the whole op even after g_menu_open
+// drops for the pre-freeze redraw. Cleared ONLY when the game threads resume — after the
+// user's "Press X" in the FreezeSave tail, or on an abort (op_abort). It sits in kernel
+// RAM (snapshotted region), so a save captures it =1 and a later LOAD stays held until
+// its resumed save-time tail clears it. See the gamma apply gates in screen_tuning.c.
+volatile int g_st_op_hold = 0;
 SceUID g_menu_thid = -1;
 // Real sceController_Service Peek/Read (set in main.c before the syscall patch);
 // defined up here so both FreezeSave and the browser can read the pad directly.
@@ -59,8 +66,7 @@ int g_compress = 1;       // PER-GAME (gameset.cfg via load_game_settings). 1 = 
 int g_default_slot = 1;   // 0 = New, 1 = Last (default): browser's initial selection
 int g_stage_spot   = 1;   // Which 8MB slot of vacated user RAM stages the kernel snapshot:
                           // 0=Low(0x88800000) 1=Mid(0x89000000, default) 2=High(0x89800000).
-                          // Mid avoids BOTH GTA's low-RAM audio DMA and the firmware's top-RAM
-                          // suspend bookkeeping. Low/High kept selectable for per-game tuning.
+                          // Mid is the default; Low/High kept selectable for per-game tuning.
                           // (High overlaps the apply blob's top-64KB -> High is save-only.)
 int g_autoload     = 0;   // PER-GAME Auto-Open-on-Boot (stored in the game's gameset.cfg,
                           // not the global settings.cfg): 1 = on boot, if this game has a
@@ -76,40 +82,68 @@ int g_frame_limit  = 0;   // PER-GAME frame cap (gameset.cfg). 0 = OFF, else a t
                           // since the right trade is game- and user-specific.
 int g_overclock_id = 0;   // GLOBAL. Index into g_oc_multipliers (0 = stock 333MHz, see the
                           // oc_* block below). Applied at every plugin boot and live from the
-                          // Settings menu. ANY firmware suspend/resume cycle (native sleep, or
-                          // our own save/load) reverts the raw PLL registers back to stock as a
-                          // side effect (confirmed by the user) — utils.c's ProcessSignals
-                          // re-applies it on RESUME_COMPLETED (see pspfatsave.h for the extern
-                          // + oc_apply's prototype; declared non-static there for that reason).
+                          // Settings menu; re-applied by utils.c's ProcessSignals on
+                          // RESUME_COMPLETED.
 int g_overclock_stable = 0;   // GLOBAL. 0 = ask "Apply Overclock?" every boot (safety for a
                           // step that hung last session). 1 = the user marked this step STABLE
                           // (Settings: Triangle on the Overclock row): skip the boot confirm and
                           // apply it directly, and show the value in RED "(Set as Stable)". X on
                           // that row clears it back to 0. Persisted in settings.cfg (buf[10]).
-int g_show_fps_overlay = 0;   // GLOBAL. 0=Off (default) 1=On/1s 2=On/0.5s 3=On/0.2s — the
-                          // number is the averaging-window length fps_tick() uses (see
-                          // fps_window_us()); live FPS counter drawn during actual gameplay
-                          // (menu closed) — see the sceDisplaySetFrameBuf hook further
-                          // below. Set from the Settings menu.
-int g_fps_show_lows = 0;      // GLOBAL. 0=Disabled (default) 1=On — also draw a 1% Low
-                          // figure (average FPS of the slowest 1% of recent frames, the
-                          // usual "worst-case stutter" metric) alongside the main FPS
-                          // number. Independent of g_show_fps_overlay's window length —
-                          // see fps_calc_1pct_low(), recalculated on its own fixed 1s
-                          // cadence regardless.
+int g_show_fps_overlay = 0;   // GLOBAL. Show-FPS MODE: 0=Off 1=FPS 2=FPS+1% 3=FPS+1%+Frametime.
+                          // The old per-value update rate moved to g_fps_rate. g_fps_show_lows
+                          // and g_show_ft_chart are DERIVED from this mode (set wherever it
+                          // changes). Live FPS counter drawn during gameplay (menu closed) — see
+                          // the sceDisplaySetFrameBuf hook. Set from the Settings menu.
+int g_fps_rate = 10;      // GLOBAL. FPS overlay update rate in 0.1s units (1..10 = 0.1..1.0s);
+                          // fps_window_us() = g_fps_rate*100000. Tri/X on the Show FPS row.
+int g_fps_show_lows = 0;      // GLOBAL. DERIVED from the Show-FPS mode (>= 2; set wherever
+                          // the mode changes — load_settings + the menu handler — never
+                          // toggled directly anymore). 1 = also draw a 1% Low figure
+                          // (average FPS of the slowest 1% of recent frames, the usual
+                          // "worst-case stutter" metric) alongside the main FPS number.
+                          // Independent of the g_fps_rate window length — see
+                          // fps_calc_1pct_low(), recalculated on its own fixed 1s cadence.
 int g_show_battery = 0;       // GLOBAL. 0=Off (default) 1=Percent 2=Percent+Time 3=ALL —
                           // live battery overlay, drawn by the same poll thread as the FPS
                           // counter (see battery_draw / fps_poll_thread). Set from the
                           // Settings menu.
+int g_batt_real_mah = 0;  // GLOBAL. User's real battery capacity in mAh (0 = stock/BMS).
+                          // The stock BMS caps its reported capacity (~1800mAh) regardless of
+                          // a bigger aftermarket cell; when set, the mAh readout is scaled by
+                          // g_batt_real_mah / (BMS full mAh) so both values reflect the real cell.
+int g_batt_stop_charge = 0;  // GLOBAL. Stop-Charging threshold in % (0 = OFF default,
+                          // else 80..95). While set, battery_poll_thread forbids charging
+                          // (scePowerBatteryForbidCharging) once the charge reaches the
+                          // threshold and re-permits it below — a cell parked on AC then
+                          // holds that % instead of aging at 100%. Set from the Settings
+                          // menu; persisted in settings.cfg word [13].
 int g_show_cpu_usage = 0;     // GLOBAL. 0=Off (default) 1=On — live CPU load % overlay,
                           // same idle-thread-clocks technique PSP-HUD uses (see
                           // cpu_usage_tick / getCpuUsage in PSP_References/PSP-HUD-master/
                           // hud/main.c). Set from the Settings menu.
-int g_show_ft_chart = 0;      // GLOBAL. 0=Off (default) 1=On — full-width scrolling frametime
+int g_show_ft_chart = 0;      // GLOBAL. DERIVED from the Show-FPS mode (== 3; set wherever
+                          // the mode changes — load_settings + the menu handler — never
+                          // toggled directly anymore). 1 = full-width scrolling frametime
                           // histogram (one column per frame, height = frametime); see
-                          // ft_chart_tick/ft_chart_draw. Independent of Show FPS: ticks and
-                          // draws even if the numeric FPS overlay is off. Set from the
-                          // Settings menu.
+                          // ft_chart_tick/ft_chart_draw. Only reachable with the numeric
+                          // overlay on (mode 3).
+int g_welcome_shown = 0;  // GLOBAL. One-time Welcome page seen flag (settings.cfg word [12]).
+                          // 0 = not yet shown -> show on the first menu open, then set 1.
+                          // 1 = already shown -> never show again. See run_welcome_screen (menu.c).
+int g_overlay_pos = 0;    // GLOBAL. Anchor corner for the FPS/battery/CPU overlay
+                          // (fps_draw): 0=Up Left (default) 1=Up Right 2=Down Left
+                          // 3=Down Right. Down modes keep the SAME top-to-bottom order
+                          // (FPS first ... battery last), anchored on the bottom edge.
+                          // Persisted in settings.cfg word [9] (older files wrote 0
+                          // there, so no generation bump was needed).
+int g_st_gamma = 100;     // PER-GAME (SAVESTATE/<gid>/screen.cfg, see st_load_game_gamma).
+                          // gamma·100: 100 = 1.00 = off (default), 50..99 = darken 0.50..0.99
+                          // (50 = full in²), 101..200 = brighten 1.01..2.00 (200 = full 2in-in²).
+                          // GE-blended over each presented frame — see screen_tuning.c. Also
+                          // re-set in st_init() at module_start — this "= 100" alone is NOT
+                          // trusted (.bss folding, see sysstats.c).
+volatile int g_st_hud = 0;        // screen-tuning HUD up (see pspfatsave.h); zeroed in st_init()
+volatile int g_st_hud_dirty = 0;  // HUD edited a value; the worker saves settings on close
 
 // Armed at menu-thread startup; the controller hook consumes it on the first read (display +
 // game threads up, umdid known) to check the per-game flag and auto-open the menu once.
@@ -137,9 +171,7 @@ volatile u32 g_stage_base = 0x89000000;   // = g_stage_bases[g_stage_spot] (defa
 
 // LOAD-only apply-blob (ApplyHandoff copy loop) location. FIXED at 0x89800000 — the
 // START of the upper 8MB (High) slot, just past the Mid snapshot it reads and clear
-// of the kernel (0x88000000..0x88800000) it writes. This was a 6-way user setting
-// ("Apply blob spot") during the cross-session-crash hunt; removed and pinned to the
-// proven default.
+// of the kernel (0x88000000..0x88800000) it writes.
 volatile u32 g_apply_base = 0x89800000;
 
 // Capture/apply suspend phase. Always PHASE0_0 (the last, most-quiesced suspend
@@ -192,14 +224,6 @@ u8 work_buf[COMPRESS_BUF_SIZE] __attribute__((aligned(64)));
 // Leaves interrupts and the kernel scheduler/dispatcher fully alive
 // so sceIo* can still block and complete. A blanket IE-bit clear
 // stops the dispatcher too, which sceIo* needs to complete a transfer.
-//
-// sceKernelSuspendThread/sceKernelGetThreadmanIdList are unreversed
-// stubs in the available uOFW checkout — this rests on the documented
-// SDK contract plus Ark-4's own recovery menu precedent (which
-// suspends named VSH threads the same way), not a verified kernel
-// implementation. A hang here (if a suspended thread held a kernel
-// lock something else needed) would be SILENT — execution never
-// reaches resume_game_threads(). Power-cycle recovery if so.
 // ────────────────────────────────────────────────────────────
 
 #define MAX_SUSPEND_THREADS 64
@@ -266,18 +290,8 @@ static void resume_nongame_threads(const SceUID *game_tids, int tcount)
 // Block until the firmware suspend completes a full sleep+resume cycle (set by
 // RESUME_COMPLETED via g_resumed). The calling thread is itself frozen+resumed
 // by the firmware across this loop, so this budget is ACTIVE-thread time (the
-// frozen sleep doesn't count). It does NOT set the suspend's wall-clock (that's
-// the +2s RTC auto-wake alarm in utils.c). The budget DOES burn while the
-// firmware's pre-descent 0x401/0x402 suspend handshake is still bouncing (a
-// vetoer reports BUSY -> retry loop; system stays awake). Observed (Ridge Racer
-// v470): a save hit that veto loop for >2s and the old 2s budget aborted a
-// suspend that may still have gone through — and the abort itself is racy, since
-// scePowerRequestSuspend can't be canceled (the pending suspend then fired
-// mid-game once the abort resumed the game threads). 5s rides out transient
-// vetoes (e.g. the game mid-MS-audio-load at freeze: kernel-side I/O drains on
-// its own — kernel threads aren't frozen) while still bounding a permanent one.
-// Safe for SAVE (the PHASE0_0 action only READS the kernel, so this thread
-// survives).
+// frozen sleep doesn't count). Safe for SAVE (the PHASE0_0 action only READS
+// the kernel, so this thread survives).
 static int wait_for_resume(void)
 {
 	int i;
@@ -285,29 +299,10 @@ static int wait_for_resume(void)
 		if (g_resumed) { g_resumed = 0; return 1; }
 		sceKernelDelayThread(5000); // 5ms
 	}
-	// Budget expired -> give up at 5s. (A +25s "descent-aware" extension for
-	// g_sleep_arm==2 was tried in v471-477 and removed: observed transient vetoes
-	// clear within ~1s (Pirates, ~16 bounces of 0x402), while a WEDGED veto — a
-	// frozen thread holding whatever the 0x402 vetoer checks — never cleared even
-	// after 30s (Ridge Racer, Ratchet & Clank rode the full extension to the end
-	// every time). The extension bought zero rescues and cost 25s per failure.
-	// NOTE the abort race remains: the pending scePowerRequestSuspend can't be
-	// canceled, so the abort's thread-resume releases the veto and the suspend
-	// then fires mid-game with capture disarmed — and the RTC alarm is past-due
-	// by then (historically a lost wake), so the console sleeps until a manual
-	// power press. A controlled abort (re-arm the alarm + ride that sleep out
-	// before showing the notice) is the known follow-up if this bites.
+	// Budget expired -> give up at 5s.
 	return 0;
 }
 
-
-// (The LOAD veto rescue is GONE entirely: v524's name-free rescue resumed every
-// frozen thread with a stack outside the staged window, but waking a RUNNABLE
-// thread onto RAM already clobbered by the staged snapshot hard-froze Dissidia
-// Duodecim. The ME veto is now PREVENTED instead of rescued: me_rpc_probe at
-// every save/load freeze guarantees no frozen thread owns the SceMediaEngineRpc
-// mutex, so the 0x402 descent can only meet LIVE holders — native-sleep
-// behavior. A residual non-ME veto aborts gracefully.)
 
 // Wall-clock microseconds via the RTC (monotonic; advances across the firmware
 // suspend, unlike the system tick). Used for the speed instrumentation (W1).
@@ -386,30 +381,12 @@ static int crc_read_next(int fd, SceOff *off)
 }
 
 // ── ME-RPC mutex probe: is the ME's RPC mutex held by a thread we froze? ──
-// me_wrapper.c (uofw 6.60 clone, PSP_References): every ME RPC
-// (sceMeCore_driver_FA398D71) LOCKS the mutex named "SceMediaEngineRpc", kicks
-// the ME, blocks on the "SceMediaEngineRpcWait" eventflag, then UNLOCKS. The
-// firmware's 0x402 suspend handshake (me_wrapper sub_1026) TryLocks that mutex —
-// held ⇒ veto. Per the audited suspend map, this is the ONLY descent veto whose
-// condition a FROZEN game thread can wedge (syscon/ctrl/idstorage vetoes are
-// kernel-side and self-clear; kernel threads are never frozen). So the single
-// invariant that makes our suspend behave like a native sleep is: no game thread
-// left frozen while OWNING that mutex. This probe checks the invariant directly
-// via sceKernelReferMutexStatus (owner + lock count, pure READ — no lock/unlock
-// side effects, no waiter handoff). Ownership is the correct test, NOT the
-// thread's wait state: a holder can be frozen INSIDE the RPC while READY (wait
-// already satisfied, unlock not yet run — observed on Duodecim: AUDIO MIXER TH
-// frozen at st=0x8 wt=0 wid=0 still owning the mutex), which any waitId-based
-// check misses. Same pattern as ms_probe_after_freeze (the MS FAT lock): probe
-// after the freeze, and if a frozen thread holds the lock the caller unfreezes
-// and retries — the released holder unlocks within a schedule slice (the ME
-// finished long ago; only the software unlock is pending).
-// Resolution at runtime (kernel object identity, no hardcoded UID — the eventflag
-// UID differed across boots: 0x181CF19 vs 0x3D25533):
-//   sceKernelSearchUIDbyName  SysMemForKernel  6.60/61 NID 0xE3F9C38E
+// Uses sceKernelReferMutexStatus (pure read) to check whether any thread in
+// suspended_ids[] owns the "SceMediaEngineRpc" mutex; if so the suspend
+// handshake would wedge, so the caller unfreezes and retries. Resolved at
+// runtime (kernel object identity, no hardcoded UID):
 //   sceKernelReferMutexStatus ThreadManForKernel 6.60/61 NID 0xA9C2CB9A
-// (ARK-4 nid_660_data.c / psplibdoc_660.xml; both absent from the SDK stub libs,
-// resolved via sctrlHENFindFunction like the ctrl/hprm/iofilemgr hooks.)
+// (absent from the SDK stub libs, resolved via sctrlHENFindFunction.)
 typedef struct {
 	SceSize size;                 // set to sizeof before the call
 	char    name[32];             // SCE_UID_NAME_LEN(31)+1 (uofw threadman_kernel.h)
@@ -421,10 +398,8 @@ typedef struct {
 } MeMutexInfo;
 
 // Sysmem UID control block, 6.60 layout (uofw include/sysmem_kernel.h
-// SceSysmemUidCB, size 36). The +12 uid / +16 name fields are hardware-proven
-// on this console (v528's eventflag name-match read them via
-// sceKernelGetUIDcontrolBlock); the ring fields (+4 instance ring, +8 type,
-// +24 type ring) come from the same authoritative struct.
+// SceSysmemUidCB, size 36): +12 uid / +16 name, +4 instance ring, +8 type,
+// +24 type-list ring (from the same authoritative struct).
 typedef struct MeUidCB {
 	struct MeUidCB *parent0;      // +0  previous sibling in the instance ring
 	struct MeUidCB *nextChild;    // +4  next sibling; ring is anchored at the TYPE CB
@@ -438,13 +413,10 @@ typedef struct MeUidCB {
 	void           *funcTable;    // +32
 } __attribute__((packed)) MeUidCB;
 
-// InterruptManagerForKernel (pspsdk -lpspkernel stubs; classic stable NIDs).
 // The UID-tree walk below runs with interrupts suspended — that stops the
 // scheduler, so no create/delete can tear the rings mid-traversal (the
-// firmware's own UID search does exactly this). Prototypes match the SDK's
-// pspintrman.h exactly (harmless duplicate if that header is already in).
-unsigned int sceKernelCpuSuspendIntr(void);
-void sceKernelCpuResumeIntr(unsigned int flags);
+// firmware's own UID search does exactly this). The sceKernelCpuSuspendIntr/
+// ResumeIntr prototypes live in pspfatsave.h.
 
 #define ME_EVF_CAP 64   // eventflag enumeration cap (SceMediaEngineRpcWait search) - was 256
 static SceUID g_me_mutex_uid = -1;
@@ -461,20 +433,11 @@ int me_rpc_probe(void)
 {
 	int t;
 	if (g_me_probe_state == 0) {
-		// v531 resolution. The firmware's own sceKernelSearchUIDbyName returned
-		// NOT_EXIST_ID (0x800200CD) for "SceMediaEngineRpc" on real 6.61 hardware
-		// (v530 wire log) even though the object exists — v528 read the SIBLING
-		// eventflag's CB name via GetUIDcontrolBlock. So by-name search is a dead
-		// end (the uofw transcription of its inner walk also looks defective).
-		// Walk the UID tree ourselves, from anchors that are all PROVEN on this
-		// console:
-		//   1. enumerate eventflags (sceKernelGetThreadmanIdList, TMID 3 — the
-		//      same call this file already makes for threads with TMID 1),
-		//   2. name-match "SceMediaEngineRpcWait" via sceKernelGetUIDcontrolBlock
-		//      (SysMemForKernel 6.60/61 NID 0xC90B0992 — worked in v528),
-		//   3. hop to its TYPE CB (+8) and iterate the type ring (+24), scanning
-		//      each type's instance ring (+4) for a CB named "SceMediaEngineRpc",
-		//   4. validate the hit with ReferMutexStatus echoing the name back.
+		// By-name search for the mutex fails on this console, so walk the UID tree
+		// from the "SceMediaEngineRpcWait" eventflag (found by name via
+		// sceKernelGetUIDcontrolBlock): hop to its TYPE CB (+8), iterate the type
+		// ring (+24), and scan each type's instance ring (+4) for a CB named
+		// "SceMediaEngineRpc"; validate the hit with ReferMutexStatus.
 		int (*getcb)(SceUID uid, MeUidCB **cb);
 		u32 fgetcb, frefer;
 		fgetcb = sctrlHENFindFunction("sceSystemMemoryManager", "SysMemForKernel", 0xC90B0992);
@@ -557,19 +520,12 @@ int me_rpc_probe(void)
 }
 
 // ── Per-op diagnostic profile (UART-only, DEBUG + DBG_UART gated) ──
-// Emits a compact per-game snapshot so different games can be COMPARED against the
-// GTA baseline directly from the wire (tested off-PC, read later). Everything here
-// is register/RAM reads only — no sceIo, safe even in the frozen window. Called at
-// op start (phase="op") and again right after the freeze (phase="frozen"), so the
-// before/after of the game's I/O + thread state is visible.
-//   [DIAG] volatile lock word (0x880E59C0): !=0 = game holds volatile (GTA does;
-//          non-lockers get only the blind SUSPENDING notify).
+// Emits a compact per-game snapshot of register/RAM state (no sceIo, safe in the
+// frozen window) at op start ("op") and right after the freeze ("frozen"):
+//   [DIAG] volatile lock word (0x880E59C0): !=0 = game holds volatile.
 //   [DIAG] DMAC channel-enable (PL080 EnbldChns, 0xBC900000+0x1C | 0xBCA00000+0x1C):
-//          !=0 = a DMA transfer is IN FLIGHT — the game's streaming/MS DMA still
-//          running while we freeze/write (the MS-contention lead).
-//   [DIAG] volatile CRC over three 64KB probes (base / +2MB / +4MB-64KB): cheap
-//          fingerprint to see whether a non-locking game has live volatile content
-//          we don't capture (candidate cause of the "runs a few seconds then stuck").
+//          !=0 = a DMA transfer is in flight.
+//   [DIAG] volatile CRC over three 64KB probes (base / +2MB / +4MB-64KB).
 // (diag_profile/diag_profile_frozen/diag_threads are declared in debug.h.)
 
 // CRC32 the whole file EXCEPT the header (offset sizeof-header .. EOF). Used
@@ -647,25 +603,10 @@ int suspend_escalating(int stable_gate, int cap_ms)
 				int w;
 				int stable = 0, cap = cap_ms;   // per-thread best-effort budget (1ms/sample); caller-provided
 					u32 wst = info.status; u32 wtype = (u32)info.waitType, wid = (u32)info.waitId, prev_wid = 0xFFFFFFFF;
-				// Mark which thread we're about to gate+suspend, BEFORE any of it. Safe
-					// here (a re-check follows in the loop, so this MS write can't cause the
-					// wake-to-READY hang described above). If a freeze deadlocks the [SUS] write below,
-					// THIS [PRE] line is the last one on MS -> names the exact culprit thread
-					// and the wait state we entered on. Behind the Show-Debug setting: two MS
-					// appends per thread cost ~50-150ms per freeze; enable in Settings to diagnose.
-					// Menu freezes (g_menu_quiet): NO MS write here — a frozen lock-holder
-					// deadlocks the append itself; buffer to RAM instead and let
-					// run_save_browser flush after the MS probe passes.
+				// Mark which thread we're about to gate+suspend, BEFORE any of it (a re-check
+					// follows in the loop). Behind the Show-Debug setting; buffered to RAM
+					// when g_menu_quiet is set.
 					if (DBG_MS()) { char pbuf[96]; sprintf(pbuf, "[PRE] %.14s st=0x%X wt=0x%X wid=0x%X", info.name, (u32)info.status, (u32)info.waitType, (u32)info.waitId); if (g_menu_quiet) gatelog_line(pbuf); else WriteDebugLogRaw(pbuf); }  // last [PRE] before a hang = the culprit thread
-					// NOTE (possible improvement): the STABLE-waitId test below is a HEURISTIC for
-					// "this thread is NOT mid-MS-read" (mid-read wait is brief and
-					// on a different object, but it CAN be fooled by a single read that lasts longer
-					// than the ~1ms sample gap (both samples land on the same read-completion object)
-					// -> we could still freeze a thread holding the msstor lock and deadlock our
-					// frozen sceIo*. A TRUE fix (we started digging: see EcsUmd9660DeviceFile / the
-					// FATMS-msstor driver) would enumerate the actual device lock (semaphore/mutex),
-					// check it is free (or find its owner), and freeze only when the MS is genuinely
-					// idle -- deterministic, not a guess. Left as a heuristic for now (stable in test).
 					for (w = 0; w < cap && !stable; w++) {   // poll for a stable idle wait (menu) / first WAITING (save/load)
 					SceKernelThreadInfo wi;
 					sceKernelDelayThread(1000);   // 1ms between samples
@@ -673,25 +614,20 @@ int suspend_escalating(int stable_gate, int cap_ms)
 					wi.size = sizeof(wi);
 					if (sceKernelReferThreadStatus(ids[i], &wi) < 0) break;
 					wst = wi.status; wtype = (u32)wi.waitType; wid = (u32)wi.waitId;
-						// A thread caught mid-MS-read is only briefly WAITING on the driver's read-completion
-						// object; requiring the SAME waitId across two samples means we suspend it only on a
-						// steady idle wait (no device lock held), never mid-read — the frozen-menu deadlock.
+						// Requiring the SAME waitId across two samples suspends only on a
+						// steady idle wait (no device lock held), never mid-MS-read.
 						if (!(wst & 0x04)) { prev_wid = 0xFFFFFFFF; continue; }  // not WAITING yet
 						if (!stable_gate) { stable = 1; break; }                 // save/load: first WAITING is enough (game I/O already stopped, no mid-read to dodge)
 						if (wid == prev_wid) { stable = 1; break; }              // menu: same wait object twice = steady idle (NOT the brief mid-read wait) -> safe to suspend
 						prev_wid = wid;
 				}
-				// Suspend IMMEDIATELY after confirming WAITING — NO I/O between the
-				// check and the call. WriteDebugLog (MS I/O, ~ms) would give the thread
-				// a window to wake to READY and hang the suspend (see the READY/WAITING
-				// note above). Log only after the call returns.
-				// Suspend with the DISPATCHER held off (sceKernelSuspendDispatchThread):
-					// sceKernelSuspendThread only HANGS when it catches a thread mid-executing
-					// kernel/driver code. With dispatch off NOTHING runs but us, so the target
-					// can't be running, so the suspend cannot hang mid-execution, and
-					// the wake race between the check and the call is gone atomically. Interrupts
-					// stay ON, so DMA/MS completion still works for our frozen sceIo*. Nothing
-					// blocking may run inside this window (no sceIo/WriteDebugLog/DelayThread).
+				// Suspend IMMEDIATELY after confirming WAITING — NO I/O between the check
+				// and the call (MS I/O could let the thread wake to READY and hang the
+				// suspend). Suspend with the DISPATCHER held off: with dispatch off nothing
+					// else runs, so the target can't be mid-execution and the wake race between
+					// the check and the call is gone atomically. Interrupts stay ON, so DMA/MS
+					// completion still works for our frozen sceIo*. Nothing blocking may run
+					// inside this window (no sceIo/WriteDebugLog/DelayThread).
 					if (stable || !stable_gate) {   // menu: only when stable. save/load: always (dispatch-off makes a READY freeze safe; I/O already stopped)
 						int ds = sceKernelSuspendDispatchThread();
 						sret = sceKernelSuspendThread(ids[i]);
@@ -736,8 +672,10 @@ static void write_thumbnail(const char *bin_path)
 	u16 *out = (u16 *)work_buf;
 	SceUID fd;
 
-	sceDisplayGetFrameBuf(&addr, &bufw, &pfmt, PSP_DISPLAY_SETBUF_IMMEDIATE);
-	if (!addr || bufw <= 0) return;
+	// Read the plugin's CLEAN captured buffer, not sceDisplayGetFrameBuf: this runs
+	// post-freeze and for a blanking game (GTA) GetFrameBuf returns the BLACK blanked
+	// buffer. dbg_capture_buf gives the pre-blank frame (or the frozen front buffer).
+	if (!dbg_capture_buf(&addr, &bufw, &pfmt)) return;
 
 	if (pfmt == PSP_DISPLAY_PIXEL_FORMAT_8888) {
 		for (y = 0; y < THUMB_H; y++) {
@@ -781,8 +719,9 @@ static void write_screenshot(const char *bin_path)
 	int n = 0;
 	SceUID fd;
 
-	sceDisplayGetFrameBuf(&addr, &bufw, &pfmt, PSP_DISPLAY_SETBUF_IMMEDIATE);
-	if (!addr || bufw <= 0) return;
+	// Read the plugin's CLEAN captured buffer (see write_thumbnail) — post-freeze,
+	// sceDisplayGetFrameBuf returns a blanking game's BLACK buffer.
+	if (!dbg_capture_buf(&addr, &bufw, &pfmt)) return;
 
 	len = (int)strlen(bin_path);
 	if (len < 4 || len + 1 > (int)sizeof(scr)) return;   // guard: never overrun scr
@@ -791,6 +730,10 @@ static void write_screenshot(const char *bin_path)
 	fd = sceIoOpen(scr, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
 	if (fd < 0) return;
 
+	// Streamed in work_buf-sized batches (the full image > work_buf). This is only
+	// coherent if the frame is STATIC while we stream — the game must already be
+	// FROZEN when this runs, otherwise it flips buffers between the per-batch writes
+	// and later rows capture a newer frame (the torn "banner" seam). Called post-freeze.
 	for (y = 0; y < 272; y++) {
 		if (pfmt == PSP_DISPLAY_PIXEL_FORMAT_8888) {
 			volatile u32 *src = (volatile u32 *)(0xA0000000 | (u32)addr) + y * bufw;
@@ -1021,7 +964,7 @@ static int prog_frac_permille(void)
 }
 
 // (dbg_dim_band — the old 50%-dim semi-transparent backdrop — was removed: the
-// panel is now always the opaque menu color BR_BG via dbg_fill_band_color.)
+// panel is now always the opaque menu color BR_BG via dbg_fill_rect_all.)
 
 
 // Redraw the panel from RAM state. redim: 0 = text only (per-step updates, which must
@@ -1188,24 +1131,16 @@ static void prog_done_us(const char *label, u32 bytes, u32 us)
 }
 
 // ────────────────────────────────────────────────────────────
-// ────────────────────────────────────────────────────────────
 // Stage 1 — SAVE: capture Main RAM + VRAM + GE context + game
 // thread contexts, streamed to MS via plain sceIo* under the
 // partial freeze from suspend_escalating() (thread suspension, not an
 // IE-bit clear — see that function's header comment).
 //
-// suspend_escalating() suspends every non-kernel (user/VSH) thread; the
-// kernel-thread branches in its switch are currently unreachable (see the
-// note above suspend_escalating). Thread CONTEXT capture is narrower still
-// (exact PSP_THREAD_ATTR_USER) — kernel/system threads aren't game state,
-// we only need them schedulable, not captured.
-//
-// This function only reads each thread's context via ThreadManForKernel_2D69D086
-// and writes the blob to the save file. Nothing reads it back on a load anymore:
-// the M5 kernel apply restores the save-time thread states wholesale (the TCBs
-// live in the applied kernel image), so the blob is diagnostic/forward-compat
-// data. (The old baseline load's per-thread thContext round-trip went with the
-// removed restore_kernel==0 path — see git history.)
+// Thread CONTEXT capture is narrowed to exact PSP_THREAD_ATTR_USER
+// (kernel/system threads aren't game state; we only need them schedulable,
+// not captured). Each thread's context is read via ThreadManForKernel_2D69D086
+// and written to the save file — diagnostic/forward-compat data (the M5
+// kernel apply restores the save-time thread states wholesale).
 // ────────────────────────────────────────────────────────────
 
 // Run the firmware's suspend QUERY poll ourselves — the exact first check the
@@ -1244,14 +1179,8 @@ int cooperative_volmem_release(const SceUID *game_tids, int tcount)
 {
 	int slot, i, j;
 
-	// v522: REVERTED v472's unconditional SUSPENDING notify — back to the v471 rule.
-	// v472 sent PSP_POWER_CB_SUSPENDING to EVERY game with a power callback, incl.
-	// non-volatile-locking games. That BROKE Pirates (bisected: v471 works, v472 breaks):
-	// its ME/audio half-parks on SUSPENDING and our freeze ~300ms later catches it mid-
-	// park -> dead sound + game freeze after save. So a non-locking game (Pirates / Ridge
-	// Racer) is now left alone (no SUSPENDING); only a game that LOCKED volatile memory
-	// (GTA, Dissidia) gets the release protocol below. The ME-RPC veto (any game) is
-	// prevented at freeze time by me_rpc_probe (the v524 rescue is gone).
+	// Only notify games that actually LOCKED volatile memory (the lock word below is
+	// non-zero); non-locking games are left alone.
 	g_game_pcb_count = 0;                              // reset every attempt (also gates the 4MB kernel window)
 	if (*(volatile u32 *)0x880E59C0 == 0) return 0;   // volatile not locked -> nothing to do
 
@@ -1273,10 +1202,8 @@ int cooperative_volmem_release(const SceUID *game_tids, int tcount)
 	}
 	ms_test_cp(9, (u32)g_game_pcb_count, "game-power-cbs-found");
 
-	// Volatile MPU nibbles around the release — pins down who zeroes them and
-	// when (v396 probe: they read 0x00000000 = all-denied by save time, which
-	// was the CP13 write freeze; boot state is 0xF/0xC). Ad-hoc diagnostic, not
-	// routed through DBG_MS (WriteDebugLogHexRaw gates on DBG_MS() itself).
+	// Volatile MPU nibbles around the release — ad-hoc diagnostic (WriteDebugLogHexRaw
+	// gates on DBG_MS() itself).
 	WriteDebugLogHexRaw("[VOLMEM] pre-release BC000008=", HWREG(0xBC000008));
 
 	// Ask the game to suspend (release volatile), then poll +36 until it clears.
@@ -1288,7 +1215,15 @@ int cooperative_volmem_release(const SceUID *game_tids, int tcount)
 	}
 	WriteDebugLogHexRaw("[VOLMEM] post-release BC000008=", HWREG(0xBC000008));
 	ms_test_cp(10, (u32)i, (i < 1000) ? "volmem-released-by-game(*5ms)" : "volmem-NOT-released-ABORT");
-	return (i < 100) ? 0 : -1;
+	// Success = the loop broke early, i.e. the lock word cleared within the 5s
+	// budget — HOWEVER LONG it took. The old `i < 100` here (500ms) was a stale
+	// threshold from an earlier loop shape and contradicted both the header
+	// comment and the CP10 label above: Killzone Liberation released at i=214
+	// (~1.07s, log showed "volmem-released-by-game" followed by "never released
+	// -> ABORT" on the very next line) and every save was aborted. A slow
+	// release is fine — the game is still running at this point; the 5s cap is
+	// the real failure boundary.
+	return (i < 1000) ? 0 : -1;
 }
 
 // ────────────────────────────────────────────────────────────
@@ -1395,7 +1330,7 @@ static int read_region_direct(SceUID fd, u32 base, u32 size)
 }
 
 // VRAM (0x84000000) is the GE's eDRAM — the Memory Stick DMA engine cannot reach
-// it, so a direct sceIoWrite/Read to/from VRAM HANGS (froze at CP15). Stage each
+// it, so a direct sceIoWrite/Read to/from VRAM hangs. Stage each
 // 64KB chunk through work_buf (DDR) with a CPU copy instead — still uncompressed,
 // still 64KB-aligned, just DMA'd from/to DDR (a CPU bounce copy, then a DDR DMA).
 static int write_vram_staged(SceUID fd)
@@ -1421,20 +1356,8 @@ static int read_vram_staged(SceUID fd)
 
 // ── DDR memory-protection window for IOBUF (the volatile region) ──
 // Programs the DDR MPU nibbles (regs @0xBC000000, 4 bits per 256KB part) for
-// the volatile 4MB via sceKernelSetDdrMemoryProtection. The nibble is a
-// per-MASTER access mask, and the observed states line up with that:
-//  - 0xF = value while a game HOLDS the volatile lock ([VOLMEM] pre-release)
-//    and the boot/vsh state — everything works there incl. the savedata
-//    utility's Memory-Stick DMA.
-//  - 0x0 = value power.prx programs when the lock is RELEASED ([VOLMEM]
-//    post-release) — any access hard-stalls (the v391 CP13 freeze).
-//  - 0xC = the kernel-partition value (loadexec/rebootex set it, then do CPU
-//    writes only). v396: CPU R/W pass under a verified 0xC. v397: froze with
-//    a verified 0xC once the batched save handed IOBUF to sceIoWrite — i.e.
-//    the MS DMA master is NOT in 0xC's mask.
-// So the IOBUF window opens with 0xF, the exact value the region has under a
-// legitimate lock holder. Needs k1=0 (as ARK's kuKernelSetDdrMemoryProtection
-// does). Return is logged (RAW).
+// the volatile 4MB via sceKernelSetDdrMemoryProtection, opening the window with
+// 0xF (all masters) so the MS DMA can reach IOBUF. Needs k1=0. Return is logged (RAW).
 #define DDR_PROT_OPEN          0xF          // all masters — the lock-holder state
 #define DDR_PROT_OPEN_NIBBLES  0xFFFFFFFF   // DDR_PROT_OPEN replicated across a reg
 static void ddr_protect_range(u32 base, u32 size, u32 val)
@@ -1447,11 +1370,8 @@ static void ddr_protect_range(u32 base, u32 size, u32 val)
 static void ddr_protect(u32 val) { ddr_protect_range(IOBUF_BASE, IOBUF_SIZE, val); }
 
 // ── Verified MPU open for IOBUF use ──
-// power.prx zeroes the volatile nibbles (0xBC000008/0C, parts 16-31) the
-// moment the game releases the volatile lock ([VOLMEM] post-release = 0x0),
-// and any access under 0x0 hangs the machine (the v391 CP13 freeze). Open
-// the window with DDR_PROT_OPEN, verify by readback, require the value to
-// survive a settle delay, re-set on failure, bounded tries. Callers use the
+// Opens the window with DDR_PROT_OPEN, verifies by readback, requires the value
+// to survive a settle delay, re-sets on failure, bounded tries. Callers use the
 // per-chunk work_buf path when this returns 0 — a save/load always completes
 // either way.
 static int iobuf_mpu_open(void)
@@ -1479,11 +1399,9 @@ int iobuf_open_verified(void)
 }
 
 // Cheap in-loop guard: re-read the nibbles before touching IOBUF and re-assert
-// once if something flipped them (v397 froze mid-save with a previously
-// VERIFIED open, so treat the state as revocable). Returns 0 when the re-assert
-// doesn't stick — callers must ABORT the batched phase (clean fail beats a bus
-// stall). Logs only when a re-assert actually happens, so the hot path is two
-// sysreg reads.
+// once if something flipped them. Returns 0 when the re-assert doesn't stick —
+// callers must ABORT the batched phase. Logs only when a re-assert happens, so
+// the hot path is two sysreg reads.
 static int iobuf_still_open(void)
 {
 	if (iobuf_mpu_open())
@@ -1553,8 +1471,7 @@ static int ra_need(struct ra_reader *r, u32 n)
 // back to per-chunk work_buf writes (always unpadded records — the pad only exists
 // to align iobuf flushes). Record headers can land at ANY byte offset (cs is rarely
 // a multiple of 4), and a direct u32 store there is an unaligned access MIPS faults
-// on (Address Error 5) — memcpy compiles to byte stores; this exact fault was the
-// real cause of every v397-v399 freeze. Adds each record's stored size to
+// on (Address Error 5) — memcpy compiles to byte stores. Adds each record's stored size to
 // *bytes_out and the summed write/flush µs to *wt_us (NULL = don't track; the
 // panel's compress/write split needs it). Returns 1 only if every write succeeded.
 static int save_region_records(SceUID fd, u32 base, u32 size, int use_iobuf,
@@ -1780,9 +1697,7 @@ static int op_abort(const SceUID *game_tids, int tcount, SceUID fd,
 	if (msg1 && dbg_buf_count > 0) {
 		if (game_tids) resume_nongame_threads(game_tids, tcount);   // wake controller service so X reads
 		// Put the notice on the VISIBLE buffer: blanking games re-point at the pre-blank
-		// capture; non-blanking games pin the frozen front buffer. Without this the panel
-		// lands off-screen on a non-blanking game (was gated on g_game_pcb_count>0, so a
-		// CRC-fail / "Load failed" notice was invisible on e.g. Pirates). Same fix as the
+		// capture; non-blanking games pin the frozen front buffer. Same fix as the
 		// save/load banner — see pin_current_display().
 		if (g_game_pcb_count > 0) reassert_display();
 		else                      pin_current_display();
@@ -1792,6 +1707,7 @@ static int op_abort(const SceUID *game_tids, int tcount, SceUID fd,
 		wait_buttons_up();
 	}
 	arm_input_suppress();   // real button presses may have been sampled while the notice was up
+	g_st_op_hold = 0;       // op aborted -> release the gamma hold the trigger set (see g_st_op_hold)
 	resume_game_threads();
 	if (g_game_pcb_count > 0) reassert_display();
 	for (i = 0; i < g_game_pcb_count; i++) sceKernelNotifyCallback(g_game_pcbs[i], PSP_POWER_CB_RESUMING);
@@ -1845,12 +1761,6 @@ int FreezeSave(const char *path)
 	// from scattered free space on every save. We write from offset 0; a smaller
 	// save leaves a stale tail (ignored — the header records every section's
 	// offset/size), a larger save extends once and then re-stabilizes.
-	//
-	// Tested O_TRUNC (2026-07-04): inconsistent write-speed effect (sometimes
-	// better than in-place at the same flush size, sometimes worse — best
-	// 4.33 MB/s, worst 3.32 MB/s across several runs, no reliable win) and a
-	// real downside: an interrupted/frozen save destroys the old save before
-	// the new one is confirmed written, unlike in-place overwrite. Reverted.
 	fd = sceIoOpen(path, PSP_O_RDWR | PSP_O_CREAT, 0777);
 	if (fd < 0) {
 		WriteDebugLogHexRaw("[FSAVE] FAILED to open save file, fd=", (u32)fd);
@@ -1859,16 +1769,11 @@ int FreezeSave(const char *path)
 
 	sceKernelDelayThread(100000); // ~100ms — let any in-flight I/O settle
 
-	// Capture the preview thumbnail now, while the (clean) game frame is on
-	// screen and before the RAM loop reuses work_buf. SAVE-only: on a LOAD the
-	// system re-enters this function's TAIL via the snapshot, not the top.
-	write_thumbnail(path);
-	write_screenshot(path);   // full-res preview for the fullscreen view (Left in the browser)
+	// Preview thumbnail + full screenshot are captured LATER, after the freeze,
+	// before the "Saving" banner — the game is frozen there so the frame is static.
 
-	// No pre-freeze VRAM banner: the game is still running here and
-	// overwrites it before it's ever readable. dbg_capture_both_bufs()
-	// is still needed though — it captures the framebuffer pointers
-	// that CP16 onward (already inside the freeze) write into.
+	// No pre-freeze VRAM banner: the game is still running here and overwrites it.
+	// dbg_capture_both_bufs() captures the framebuffer pointers that the freeze writes into.
 	dbg_capture_both_bufs();
 	dbg_fg = 0xFFFFFFFF; dbg_bg = 0xFF000000;
 	ms_test_row = 0;
@@ -1880,23 +1785,20 @@ int FreezeSave(const char *path)
 
 	// Ask the game to release its volatile-memory lock (via its power callback) BEFORE we
 	// freeze it — a frozen game can't run its handler, and the suspend won't sleep while
-	// volatile is locked. Also necessary for sub_16389() (firmware PHASE0_5 ME halt sequence):
-	// that handler sends a halt interrupt to the ME and spins until the ME acks; if GTA's ME
-	// firmware is still running audio it never responds and the firmware hangs. The game's
-	// callback gracefully stops the ME program, ensuring sub_16389() can complete and call
-	// sceSysregMeBusClockDisable() before Phase0_0 fires. If it won't let go within 5s, abort.
+	// volatile is locked. If it won't let go within 5s, abort.
 	if (cooperative_volmem_release(game_tids, tcount) < 0) {
 		WriteDebugLogRaw("[FSAVE] game never released volatile mem -> ABORT save");
 		return op_abort(game_tids, tcount, fd, path, NULL, NULL);   // game still running (not frozen) -> silent; delete the empty file
 	}
 
-	// The game blanked the screen inside its SUSPENDING handler (above). Re-point
-	// the display at the captured frame and show "Saving" NOW — BEFORE the freeze
-	// loop, which can take a moment if a game thread is slow to reach a stable
-	// wait. Otherwise the screen sits black (backlight on) for that whole window.
-	// Reasserted again after the freeze (below) in case the still-running game
-	// re-blanked in between.
-	if (g_game_pcb_count > 0) { reassert_display(); prog_begin("Saving"); }
+	// The game blanked the screen inside its SUSPENDING handler (above). Re-point the
+	// display at the captured (clean) frame NOW — BEFORE the freeze loop, which can take
+	// a moment if a game thread is slow to reach a stable wait — so the screen doesn't
+	// sit black for that window. Do NOT draw the "Saving" banner here: the screenshot is
+	// captured post-freeze (below) and would grab the banner (banner-in-screenshot bug).
+	// The banner is drawn by prog_begin AFTER the screenshot. Reasserted again after the
+	// freeze in case the still-running game re-blanked in between.
+	if (g_game_pcb_count > 0) reassert_display();
 
 	// ── QUIESCENT-POINT FREEZE (Stage 3): per-thread suspend of ONLY the
 	// game's user threads, tracking exactly what we suspend so resume is
@@ -1915,12 +1817,8 @@ int FreezeSave(const char *path)
 			if (probe_suspend_query() == 0) {            // no driver mid-op right now
 				fails = suspend_escalating(0, 50);    // save: FAST gate (freeze on first WAITING, else dispatch-off) — game I/O already stopped by cooperative_volmem_release, so no mid-read to dodge; freezes threadmain reliably instead of looping on a never-"stable" thread
 				// Commit only when EVERY thread froze AND the query is still clear AND
-				// no frozen thread owns the ME RPC mutex (me_rpc_probe) — a frozen
-				// owner would wedge the 0x402 descent veto forever (the CP27 timeout
-				// + phantom-sleep tail). On probe fail the unfreeze below releases
-				// the holder; it unlocks within a schedule slice and the retry
-				// re-freezes it clean. Same unfreeze-retry shape as the MS FAT-lock
-				// probe at menu-open (ms_probe_after_freeze).
+				// no frozen thread owns the ME RPC mutex (me_rpc_probe). On probe fail
+				// the unfreeze below releases the holder, and the retry re-freezes it.
 				if (fails == 0 && probe_suspend_query() == 0 && me_rpc_probe() == 0) frozen = 1;
 				else resume_game_threads();              // a thread wouldn't freeze, race lost, or frozen ME-mutex holder -> unfreeze, retry
 			}
@@ -1928,8 +1826,8 @@ int FreezeSave(const char *path)
 		}
 		ms_test_cp(11, (u32)q, frozen ? "froze-at-quiescent" : "no-quiescent-fellback");
 		if (frozen) {
-			// Post-freeze snapshot: is game DMA still in flight (MS contention lead),
-			// and what are the frozen game threads waiting on? Compare vs GTA.
+			// Post-freeze snapshot: is game DMA still in flight, and what are the frozen
+			// game threads waiting on?
 			diag_profile_frozen("save-frozen");
 			diag_threads("save-frozen", game_tids, tcount);
 		}
@@ -1949,6 +1847,14 @@ int FreezeSave(const char *path)
 	// pin_current_display().
 	if (g_game_pcb_count > 0) reassert_display();
 	else                      pin_current_display();
+
+	// Capture the previews NOW: the game is frozen and the display was just re-pointed
+	// at the clean frame, so it's static (no buffer flips) and the "Saving" banner
+	// isn't drawn yet. This is why the screenshot's per-batch streaming no longer tears.
+	// Still before the RAM loop that reuses work_buf. SAVE-only: a LOAD re-enters the
+	// TAIL via the snapshot, not here.
+	write_thumbnail(path);
+	write_screenshot(path);   // full-res preview for the fullscreen view (Left in the browser)
 
 	prog_begin("Saving");   // weighted bar (W_SAVE_*): RAM+VRAM save, suspend, kernel save, restore
 
@@ -2045,13 +1951,10 @@ int FreezeSave(const char *path)
 	} else {
 		// VRAM flushes are UNPADDED (padded=0, unlike the RAM section): the GE/thread
 		// sections read straight after VRAM via the current file position, so a padded
-		// VRAM tail would desync those reads. That makes a MID-loop flush harmful — it
-		// ends on an unaligned offset, so the NEXT flush starts unaligned and every
-		// cluster after it costs a card read-modify-write => the intermittent ~4MB/s
-		// VRAM write. VRAM (<=2MB in, <=~2.2MB compressed) always fits the 4MB IOBUF,
-		// so padded=0 forces a SINGLE tail flush: it starts on the aligned vram_pos, so
-		// only its final cluster is unaligned (negligible). The file bytes are identical
-		// either way (records pack back-to-back), so the load path is unchanged.
+		// VRAM tail would desync those reads. VRAM always fits the 4MB IOBUF, so
+		// padded=0 forces a SINGLE tail flush that starts on the aligned vram_pos. The
+		// file bytes are identical either way (records pack back-to-back), so the load
+		// path is unchanged.
 		io_ok &= save_region_records(fd, VRAM_BASE_CACHED, VRAM_SIZE,
 		                             use_iobuf, 0, &vram_bytes, &vram_wt_us, "VRAM");
 	}
@@ -2138,13 +2041,10 @@ int FreezeSave(const char *path)
 		ms_test_cp(22, g_kcap_size, "kernel-capture-via-suspend");
 		g_op_mode = 0;            // SAVE; the snapshot captures this. A LOAD patches the
 		                          // snapshot's copy to 1 so its resume takes the LOAD branch.
-		// No flash-driver repair on the SAVE path. A SAVE only READS kernel RAM
-		// (no rollback), so like a native power-switch sleep the firmware keeps the
-		// flash drivers coherent across its own suspend/resume — repairing is
-		// redundant and (per the v510 bisection) froze Dissidia. The LOAD path does
-		// need it (it rolls the kernel back to a stale flash state); it runs in
-		// utils.c on RESUME_COMPLETED — in-place lflash df_exit/df_init (FTL rebuild)
-		// bracketed by a flash1: remount, keyed on g_lc.op_mode == 1.
+		// No flash-driver repair on the SAVE path — a SAVE only reads kernel RAM, so
+		// the firmware keeps the flash drivers coherent across its own suspend/resume.
+		// (The LOAD path's repair runs in utils.c on RESUME_COMPLETED, keyed on
+		// g_lc.op_mode == 1.)
 		g_resumed = 0;
 		g_sleep_mode = 9;                              // capture kernel -> GAME_STAGE_KERNEL at g_cap_phase
 		// Always capture the full 8MB kernel window.
@@ -2158,12 +2058,10 @@ int FreezeSave(const char *path)
 		g_sleep_arm = 1;
 		ClearCaches();
 		// The game already released its volatile-memory lock cooperatively (its power
-		// callback, before the freeze), so scePower's +36 flag is clear and the native
-		// suspend can FREEZE. No force-unlock needed here (the LOAD path runs the same way).
-		// NOTE: do NOT sceUmdDeactivate here. It powers down the logical UMD drive,
-		// which GTA's streaming engine sees as a disc-removal error ("Error reading
-		// the UMD") and never recovers from. In-flight UMD DMA is instead drained at
-		// the Phase0_0 capture point (DMAC EnbldChns spin in utils.c), which is enough.
+		// callback, before the freeze), so the native suspend can FREEZE. No force-unlock
+		// needed here.
+		// NOTE: do NOT sceUmdDeactivate here — in-flight UMD DMA is drained at the
+		// Phase0_0 capture point (DMAC EnbldChns spin in utils.c) instead.
 		t_mark = now_us();
 		// No progress-bar segment opens here: the CPU-off firmware suspend can't tick (no
 		// CPU) and isn't given a weight of its own (see the progress-bar model comment
@@ -2179,34 +2077,22 @@ int FreezeSave(const char *path)
 			return op_abort(game_tids, tcount, fd, path, "Save failed", "Try again");
 		}
 		// Re-init UART post-resume so the tail is visible: the firmware suspend resets
-		// the UART core / HPRM re-grabs the port, and the +0x44 status clear in
-		// uart_init un-wedges the latched TXFULL (see HOWTO_UART.md §3, §7). Safe here:
-		// wait_for_resume() returned -> RESUME_COMPLETED fired, the firmware+dispatcher
-		// are fully alive and this (menu) thread is running normally. Covers both SAVE
-		// and LOAD (LOAD re-enters this same tail). Gated on the UART setting so an
-		// off setting makes no firmware calls / 100ms sleep here. No-op in a release build.
+		// the UART core / HPRM re-grabs the port. Safe here — RESUME_COMPLETED fired, so
+		// the firmware and this thread are running normally. Gated on the UART setting;
+		// no-op in a release build.
 		if (DBG_UART()) {
 			uart_init();   // (banner-line removed; the post-resume tail existing at all confirms the re-init)
 		}
-		// Overclock reapply is NOT done here — moved to utils.c's ProcessSignals on
-		// RESUME_COMPLETED, which fires for EVERY firmware resume (native sleep too,
-		// not just our own save/load), and runs BEFORE wait_for_resume() even returns
-		// (it's what SETS g_resumed). So by the time this tail runs, it has already
-		// happened.
-		// LOAD continuation: the kernel rollback restored the save-time row counter and
-		// the VRAM restore repaints the save's debug overlay across the TOP rows. We keep
-		// that overlay and print the load's tail messages in the always-free lower half
-		// (rows 18+) instead, so they never collide with the save lines. (SAVE keeps its
-		// continuous live display — no rollback there.) The "Loading" panel is rebuilt a
-		// few lines below (g_op_mode == 1 block); no separate transient banner here.
+		// Overclock reapply is done in utils.c's ProcessSignals on RESUME_COMPLETED,
+		// which runs before this tail.
+		// LOAD continuation: the kernel rollback restored the save-time debug overlay,
+		// so print the load's tail messages in the always-free lower half (rows 18+)
+		// to avoid the save lines.
 		if (g_op_mode == 1) {
 			ms_test_row = 18;
 		}
-		// Stamp activity = NOW (new-session clock) so the power manager doesn't see the
-		// stale save-time "last activity" tick and idle-off the display during the RAM/
-		// VRAM restore. Without this, a load made long after the save (cross-session)
-		// resumes to a blanked screen that only wakes on a button press. Fire it BEFORE
-		// the restore so it beats the idle check.
+		// Stamp activity = NOW so the power manager doesn't idle-off the display during
+		// the restore; fire it before the restore.
 		scePowerTick(PSP_POWER_TICK_ALL);
 		TLOG("[TIME] suspend+kernel-capture ms=", t_mark);
 		ms_test_cp(23, g_kcap_size, "snapshot-in-gameRAM-ok");
@@ -2235,11 +2121,9 @@ int FreezeSave(const char *path)
 			sceIoLseek(fd, kernel_pos, PSP_SEEK_SET);
 			prog_step("Saving kernel", W_SAVE_KERNEL, PB_KERNEL_MS);
 			{
-				// Same batched-IOBUF path as RAM/VRAM (measured ~1.3 MB/s here
-				// per-chunk vs up to ~4 MB/s batched) — safe to reuse post-resume:
+				// Same batched-IOBUF path as RAM/VRAM — safe to reuse post-resume:
 				// the game threads are still parked (only VSH/system were woken
-				// above), so nothing has re-locked volatile memory yet; the RAM/
-				// VRAM restore right after this already re-verifies the same way.
+				// above), so nothing has re-locked volatile memory yet.
 				int use_iobuf_kn = g_compress ? iobuf_open_verified() : 0;   // Fast mode: direct, no MPU unlock
 				u32 kbytes = 0;
 				if (!g_compress) {
@@ -2263,10 +2147,8 @@ int FreezeSave(const char *path)
 			TLOG("[TIME] kernel compress+write ms=", t_mark);
 
 			// Patch kernel_pos now (cheap, one word). DEFER the whole-file CRC: it
-			// re-reads the file (~1.2s) but only touches the finished MS file, not
-			// any frozen game state — so we compute it AFTER resuming the game (see
-			// below), off the visible freeze, the way the original V2 streamed its
-			// buffer to MS with the game already running.
+			// re-reads the file but only touches the finished MS file, so we compute
+			// it AFTER resuming the game (see below), off the visible freeze.
 			{
 				u32 kp = (u32)kernel_pos;
 				sceIoLseek(fd, (SceOff)(7 * sizeof(u32)), PSP_SEEK_SET);
@@ -2293,12 +2175,9 @@ int FreezeSave(const char *path)
 			ms_test_cp(30, 0, "LOAD-resume: NO MS write");
 		}
 
-		// LOAD: the kernel rollback wiped the pre-suspend panel (the resumed tail carries
-		// the SAVE-TIME panel state). Rebuild it as "Loading" and re-show the two pre-
-		// suspend steps: the labels are fixed and the rates rode across the apply in the
-		// load-carry block (g_lc.verify_mbps/read_mbps, patched into the snapshot beside
-		// the LOAD marker). "Restoring RAM/VRAM" is appended below. Uses the captured-
-		// buffer path (prog_* -> dbg_print_all), safe post-apply.
+		// LOAD: the kernel rollback wiped the pre-suspend panel, so rebuild it as
+		// "Loading" and re-show the two pre-suspend steps (the rates rode across the
+		// apply in g_lc.verify_mbps/read_mbps). "Restoring RAM/VRAM" is appended below.
 		if (g_op_mode == 1) {
 			strncpy(g_prog_title, "Loading", sizeof(g_prog_title) - 1); g_prog_title[sizeof(g_prog_title) - 1] = 0;
 			strcpy(g_prog_label[0], "Verifying save"); g_prog_mbps[0] = g_lc.verify_mbps;
@@ -2368,12 +2247,9 @@ int FreezeSave(const char *path)
 		// X to continue" prompt (waiting on the user) or background CRC overlapped
 		// with the already-resumed game — not part of the freeze being timed.
 		trace_flush("[TRACE] FreezeSave (start .. RAM+VRAM restore)");
-		// GATE: a transient MS read error mid-restore leaves half-restored,
-		// incoherent game RAM/VRAM. Resuming into it can crash the game or corrupt
-		// its in-game save, so: do NOT resume — leave the game frozen for a clean
-		// power-cycle and report failure. (For a SAVE the file on MS is complete
-		// except its CRC; a re-save after power-cycle is the recovery. We
-		// deliberately do not certify it here.)
+		// GATE: a transient MS read error mid-restore leaves half-restored game
+		// RAM/VRAM — do NOT resume; leave the game frozen for a clean power-cycle
+		// and report failure.
 		if (!restore_ok) {
 			WriteDebugLogRaw("[FSAVE] RAM/VRAM restore incomplete post-resume -> game left frozen; power off");
 			if (fd >= 0) sceIoClose(fd);
@@ -2384,11 +2260,7 @@ int FreezeSave(const char *path)
 	// Save/load done; game still frozen. Show "Press X to continue" and, in the SAME
 	// loop, run the finalize work that doesn't need the freeze — the Game.thb copy and
 	// the file CRC — so it overlaps the user's read time instead of waiting for X. Resume
-	// the instant X is pressed; finish any leftover CRC with the game running. LOAD
-	// re-entry / a failed save (io_ok==0, e.g. the kernel-section short write reached
-	// here post-resume) has do_bg_crc=0, so it just waits for X (no CRC, no Game.thb) and
-	// shows the red failure notice below. (A PRE-suspend save failure never reaches here —
-	// GATE 1 handles it via op_abort.)
+	// the instant X is pressed; finish any leftover CRC with the game running.
 	{
 		SceCtrlData pad; int prev, xhit = 0;
 		u32 crc = CRC32_INIT; int crc_active = (do_bg_crc && fd >= 0);
@@ -2422,9 +2294,8 @@ int FreezeSave(const char *path)
 				dbg_transparent = 1; dbg_fg = BR_GREEN;
 				dbg_row = BAR_TEXT_ROW; dbg_col = (60 - (int)strlen(tl)) / 2; if (dbg_col < 0) dbg_col = 0;
 				dbg_print_all(tl);
-				// Log the SAME line to UART HERE — before the "Press X" wait below — so it
-				// appears on the wire when the op is actually done, not after the user
-				// finally presses X (which was the "time line appears after X" complaint).
+				// Log the SAME line to UART HERE, before the "Press X" wait, so it appears
+				// on the wire when the op is actually done.
 				WriteDebugLogRaw(tl);
 			}
 		}
@@ -2473,19 +2344,17 @@ int FreezeSave(const char *path)
 		}
 		wait_buttons_up();                               // don't leak the continue-X into the game (BufferPositive)
 		// Also suppress the continue-X across the latch AND buffer-backlog paths (see
-		// arm_input_suppress) — both self-clear/self-drain on their own now, so the
-		// 100ms delay + explicit clear below is just a belt-and-suspenders backstop
-		// for latch specifically, not load-bearing. Snapshot already written (flag
-		// was 0 at capture).
+		// arm_input_suppress).
 		arm_input_suppress();
+		// Op done, user pressed X: release the gamma hold the save/load trigger set so
+		// the correction reappears now that the game is resuming. See g_st_op_hold.
+		g_st_op_hold = 0;
 		resume_game_threads();
 		sceKernelDelayThread(100000);                    // ~100ms: game reads+drains the latch (latch input only)
 		g_suppress_latch = 0;
 
-		// Finish the CRC if X interrupted it mid-hash — the game is RUNNING now, so YIELD between
-		// chunks. Reading the file back-to-back with no sleep (as during the frozen prompt) starves
-		// the game's own Memory-Stick reads -> the massive lag. A short sleep per chunk lets the
-		// game's reads interleave; the leftover is small (the prompt loop advanced most of it).
+		// Finish the CRC if X interrupted it mid-hash — the game is RUNNING now, so
+		// yield between chunks (a short sleep lets the game's MS reads interleave).
 		while (crc_active) {
 			sceKernelDelayThread(2000);                  // 2ms: hand the resumed game a Memory-Stick window
 			if (!bg_crc_step(fd, &crc_off, &crc, &io_ok)) {
@@ -2503,20 +2372,14 @@ int FreezeSave(const char *path)
 	// Report failure if any write short-wrote (the file was left uncertified above,
 	// so it will be rejected on load) — never a false "completed" to the caller/UI.
 	if (!io_ok) {
-		// Delete the incomplete file so it doesn't clutter the save list (it would be
-		// rejected on load anyway). fd is already closed above. Safe: io_ok is only ever
-		// cleared by a failed sceIoWrite, and a LOAD's resumed tail never writes the
-		// savegame — so io_ok stays 1 there and this block is a real failed SAVE only,
-		// with path = that save's own file.
+		// Delete the incomplete file so it doesn't clutter the save list.
 		sceIoRemove(path);
 		WriteDebugLogRaw("[FSAVE] Save FAILED (short write) — incomplete file deleted.");
 		return -1;
 	}
-	// (The "Save/Load time:" UART line is emitted UP at the panel-draw point, before
-	// the "Press X" wait — not here — so it lands on the wire when the op finishes.)
-	// Post-op one-shot thread + DMA sample: the Class-B failure (loads that run a
-	// few seconds then freeze) dies AFTER this point, so this snapshot of the
-	// resumed game's threads is the last state we can log before the game runs.
+	// (The "Save/Load time:" UART line is emitted up at the panel-draw point, before
+	// the "Press X" wait — not here.)
+	// Post-op one-shot thread + DMA sample of the resumed game's threads.
 	if (was_load) { diag_profile("post-load"); diag_threads("post-load", game_tids, tcount); }
 	WriteDebugLog(was_load ? "[FLOAD] Full load completed." : "[FSAVE] Full save completed.");
 	return 0;
@@ -2564,8 +2427,7 @@ int FreezeLoad(const char *path)
 	live_tcount = identify_game_threads(game_tids, NULL);
 
 	// Ask the game to release its volatile-memory lock before we freeze it (same as the
-	// save path) so the load's kernel-rollback suspend can sleep instead of stalling at
-	// PHASE1_2. Abort the load cleanly if it won't let go within 5s.
+	// save path). Abort the load cleanly if it won't let go within 5s.
 	if (cooperative_volmem_release(game_tids, live_tcount) < 0) {
 		WriteDebugLogRaw("[FLOAD] game never released volatile mem -> ABORT load");
 		return op_abort(game_tids, live_tcount, fd, NULL, NULL, NULL);   // running (not frozen) -> silent; load makes no file
@@ -2580,11 +2442,9 @@ int FreezeLoad(const char *path)
 	// threads stay alive. ──
 	{
 		// If any game thread won't freeze, do NOT apply the loaded state over a running
-		// thread (crash/corruption) — resume and abort the load cleanly. Retried with
-		// me_rpc_probe() like the SAVE loop: a frozen ME-RPC mutex owner would wedge the
-		// 0x402 descent veto (the old "[FLOAD] descent vetoed" hang). Probing HERE —
-		// before the snapshot is staged over game RAM — means even the abort is fully
-		// resumable, unlike the post-request frozen-fail ("power off") further down.
+		// thread — resume and abort the load cleanly. Retried with me_rpc_probe() like
+		// the SAVE loop; probing before the snapshot is staged keeps even the abort
+		// resumable.
 		{
 			int attempt, ok = 0;
 			for (attempt = 0; attempt < 20 && !ok; attempt++) {
@@ -2605,8 +2465,7 @@ int FreezeLoad(const char *path)
 
 	// Land the load-phase overlay on the VISIBLE buffer with a matching stride (see the
 	// matching FreezeSave note + pin_current_display). Blanking games: re-point at the
-	// pre-blank capture. Non-blanking games: adopt+pin the frozen front buffer (fixes the
-	// intermittent banner-shift / no-banner).
+	// pre-blank capture. Non-blanking games: adopt+pin the frozen front buffer.
 	if (g_game_pcb_count > 0) reassert_display();
 	else                      pin_current_display();
 
@@ -2625,14 +2484,12 @@ int FreezeLoad(const char *path)
 	// Read the FILE's format, not the current g_compress, since a load may run under a
 	// different setting than the save used.
 	int uncompressed = (header[11] & SAVE_FLAG_UNCOMPRESSED) != 0;
-	// Version mismatch is just logged, not rejected — we're actively
-	// iterating and the version number bumps on every build.
+	// Version mismatch is just logged, not rejected.
 	ms_test_cp(40, header[1], "header-validated(version)");
 
 	// ── INTEGRITY CHECK: CRC32 the file (after the header) and compare to the
-	// value stored at save time, BEFORE we commit to the load. Loading overwrites
-	// the live kernel during the suspend, so applying a corrupt snapshot can
-	// crash/corrupt the system — reject here instead. Same byte range as the save
+	// value stored at save time, BEFORE we commit to the load, so a corrupt
+	// snapshot is rejected instead of applied. Same byte range as the save
 	// computed (after the header .. EOF), so it matches regardless of any tail. ──
 	{
 		u32 want_crc = header[8];
@@ -2658,9 +2515,8 @@ int FreezeLoad(const char *path)
 	// point. We do NOT decompress game RAM/VRAM here: the save-time kernel
 	// snapshot captured the poll thread mid-FreezeSave, so on resume that thread
 	// runs FreezeSave's tail, which restores the full 24MB game RAM (+VRAM) from
-	// THIS SAME file. So loading = "let the save finish." We only need to stage
-	// the kernel snapshot + the apply routine in game RAM and overwrite the
-	// kernel at PHASE0_0. ──
+	// THIS SAME file. We only need to stage the kernel snapshot + the apply
+	// routine in game RAM and overwrite the kernel at PHASE0_0. ──
 	{
 		u32 kpos = header[7];
 		// Load path stages ApplyHandoff (one-way: copy + cache flush + jump to
@@ -2671,7 +2527,7 @@ int FreezeLoad(const char *path)
 		unsigned int k;
 
 		// The apply-blob location is FIXED at g_apply_base (0x89800000) — mode 10 in
-		// utils.c executes from this same address. (Was a user-swept setting; pinned.)
+		// utils.c executes from this same address.
 		slot = (volatile unsigned char *)(g_apply_base + KSEG1_ALIAS);
 		ms_test_cp(38, g_apply_base, "apply-blob-base");
 
@@ -2723,16 +2579,12 @@ int FreezeLoad(const char *path)
 
 		// Mark this as a LOAD so the save-time continuation (which re-enters
 		// FreezeSave's tail after the kernel rollback) does a READ-ONLY restore
-		// and never writes the savegame. Set the live flag (covers g_op_mode
-		// being outside the captured window) AND patch the staged snapshot's
-		// copy (the value the restored kernel actually sees). The flash-driver
-		// repair the rollback needs runs on RESUME_COMPLETED in utils.c (in-place
-		// lflash df_exit/df_init + flash1: remount, keyed on the patched op_mode == 1).
+		// and never writes the savegame. Set the live flag AND patch the staged
+		// snapshot's copy (the value the restored kernel actually sees).
 		{
 			// Use the SAVE-TIME &g_op_mode (header[9]) — NOT our own, which differs
 			// every boot — so the patch lands on the flag's real offset in the saved
-			// snapshot. Using the live address here corrupts an unrelated kernel word
-			// (the plugin moved) and freezes the apply (observed cross-session).
+			// snapshot.
 			u32 opaddr = header[9];
 			g_op_mode = 1;
 			WriteDebugLogHex("[FLOAD] save-time &g_op_mode=", opaddr);
@@ -2754,26 +2606,18 @@ int FreezeLoad(const char *path)
 				*(volatile u32 *)(lc + 16) = g_lc.start_hi;
 				// (CP44 success log removed — the handoff-ctx-addr-ok CP44 below covers it.)
 			} else {
-				// The save-time &g_op_mode lies outside the 8MB kernel window
-				// (corrupt/hostile header, or plugin loaded elsewhere at save
-				// time). We CANNOT patch the snapshot's LOAD flag, so on resume the
-				// save-time tail would take its SAVE branch and overwrite + re-CRC
-				// the user's save file (self-certifying corruption). ABORT instead
-				// of arming the suspend.
+				// The save-time &g_op_mode lies outside the 8MB kernel window — we
+				// cannot patch the snapshot's LOAD flag, so ABORT instead of arming
+				// the suspend.
 				ms_test_cp(44, opaddr, "g_op_mode-OUTSIDE-window-FAILED-ABORT");
 				return op_frozen_fail("Load failed", "Power off the PSP");   // snapshot already staged over game RAM -> cannot resume
 			}
 		}
 
-		// Carry the CURRENT session's overclock setting through the kernel rollback:
-		// without this, the restored kernel would keep whatever g_overclock_id this
-		// PARTICULAR save was made with (the kernel rollback restores the plugin's
-		// own globals to save-time state, same reason g_op_mode needs patching above)
-		// — silently changing the user's overclock choice based on which save they
-		// loaded. Best-effort, unlike g_op_mode/g_handoff_ctx above: a bad address
-		// here just means the setting doesn't carry over (falls back to the save's
-		// own value, i.e. pre-existing behavior) — NOT worth aborting an otherwise-
-		// good load over.
+		// Carry the CURRENT session's overclock setting through the kernel rollback
+		// (the rollback restores the plugin's globals to save-time state, same reason
+		// g_op_mode needs patching above). Best-effort: a bad address just means the
+		// setting doesn't carry over — not worth aborting the load over.
 		{
 			u32 ocaddr = header[12];
 			if (ocaddr >= KERNEL_RAM_BASE && ocaddr + 4 <= KERNEL_RAM_BASE + KERNEL_RAM_SIZE && (ocaddr & 3) == 0) {
@@ -2786,10 +2630,9 @@ int FreezeLoad(const char *path)
 		}
 
 		// Save-time dispatcher-context address for the one-way handoff. ApplyHandoff
-		// reads a 64-byte block here FROM THE APPLIED IMAGE and jumps to its ra, so a
-		// bad address means jumping through garbage — validate it lies fully inside
-		// the kernel window, like the g_op_mode patch above. An old 10-word save has
-		// RAM-chunk data in this slot and is rejected here (re-save with this build).
+		// reads a 64-byte block here FROM THE APPLIED IMAGE and jumps to its ra, so
+		// validate it lies fully inside the kernel window, like the g_op_mode patch
+		// above.
 		{
 			u32 ctxaddr = header[10];
 			if (ctxaddr < KERNEL_RAM_BASE ||
@@ -2816,28 +2659,13 @@ int FreezeLoad(const char *path)
 		g_sleep_arm = 1;
 		ClearCaches();
 		// (No ME 0x402-veto handling needed here: the me_rpc_probe at this load's
-		// freeze guaranteed no FROZEN thread owns the SceMediaEngineRpc mutex, and
-		// frozen threads can't acquire it afterwards — so the descent's veto can
-		// only see LIVE holders, which release on their own, exactly like a native
-		// sleep. The v528 mailbox bypass at 0xBFC00700 was removed with that.)
+		// freeze guaranteed no FROZEN thread owns the SceMediaEngineRpc mutex.)
 		scePowerRequestSuspend(); // async; on success the firmware freezes us here and resumes
-		// into the SAVE-TIME kernel — the apply OVERWRITES this plugin, so we never return. (That's
-		// why we can't use wait_for_resume() like SAVE, whose thread survives a read-only capture.)
-		// FAILURE GUARD (descent-aware): on success we freeze inside the poll below and never
-		// run past it; if we ARE still running, g_sleep_arm distinguishes the two failures:
-		//  - still 1 after ~2s: the 0x401 power-lock never fired — the request never
-		//    started; abort.
-		//  - == 2: a descent IS in flight but the 0x401/0x402 handshake keeps retrying.
-		//    A frozen ME-RPC mutex holder (the historic wedge) is prevented by the
-		//    me_rpc_probe at this load's freeze, so a persistent BUSY means some OTHER
-		//    vetoer (syscon packets / ctrl transfer — kernel-side, self-clearing).
-		//    Ride the full ~5s cap, re-pushing the auto-wake alarm so a late descent
-		//    still has a LIVE alarm (the +2s alarm armed at the 0x401 goes past-due
-		//    during this wait, and a past-due alarm has historically been a lost wake:
-		//    console asleep until a manual power press). Then abort gracefully. There
-		//    is no thread-resume rescue anymore: v524's rescue woke runnable threads
-		//    onto RAM already clobbered by the staged snapshot and hard-froze Dissidia
-		//    Duodecim — a graceful "power off" beats a hard freeze.
+		// into the SAVE-TIME kernel — the apply OVERWRITES this plugin, so we never return.
+		// FAILURE GUARD: if we are still running after the poll below, the request never
+		// completed — abort. On g_sleep_arm==2 a descent is still retrying the 0x401/0x402
+		// handshake, so ride the ~5s cap, re-pushing the auto-wake alarm so a late descent
+		// still has a live alarm; then abort gracefully.
 		{
 			int spin, waited = 0;
 			for (spin = 0; spin < 100; spin++) {     // ~5s safety cap
@@ -2857,11 +2685,8 @@ int FreezeLoad(const char *path)
 		}
 		if (g_sleep_arm == 2)
 			WriteDebugLogRaw("[FLOAD] descent still vetoed after ~5s (non-ME vetoer?) -> abort");
-		// Disarm the mode-10 apply: the suspend never took, so if the user presses power
-		// to SLEEP (instead of holding to power off) the native suspend would otherwise
-		// apply the staged kernel snapshot outside the controlled flow (kernel overwrite).
-		// Also drop the wake alarm — left registered it would wake the next native sleep
-		// instantly (see the RESUME_COMPLETED handler, utils.c).
+		// Disarm the mode-10 apply (the suspend never took) and drop the wake alarm so
+		// the next native sleep isn't woken instantly (see the RESUME_COMPLETED handler).
 		g_sleep_arm = 0; g_sleep_mode = 0;
 		sceRtcSetAlarmTick(NULL);
 		WriteDebugLogRaw("[FLOAD] kernel-apply suspend NEVER FIRED -> ABORT (game left frozen; power off)");
@@ -2873,10 +2698,8 @@ int FreezeLoad(const char *path)
 
 // Arm BOTH post-resume input-suppress mechanisms together — call right before
 // resume_game_threads() at any point real button presses may have been sampled
-// into the hardware's controller state while the game sat frozen (menu close,
-// save/load trigger, an abort's notice-then-resume, or FreezeSave/FreezeLoad's own
-// final Press-X resume). See the block comments on g_suppress_latch's hooks and
-// suppress_posbuf_slots for what each one covers and how each clears itself.
+// while the game sat frozen. See the block comments on g_suppress_latch's hooks
+// and suppress_posbuf_slots.
 void arm_input_suppress(void)
 {
 	g_suppress_latch = 1;
@@ -2888,7 +2711,6 @@ void arm_input_suppress(void)
 
 
 
-// the game (the op finishes), reaps the probe, retries.
 static SceUID g_probe_fd = -1;   // pending probe fd (reaped after an unfreeze)
 
 // Returns 1 = MS usable (probe completed + closed). 0 = FAT lock held by a

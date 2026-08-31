@@ -6,16 +6,9 @@
 #include "videoskip.h"
 #include "menu.h"
 #include "fatsave.h"
+#include "screen_tuning.h"
 
 // ── Live FPS overlay (optional, drawn during actual gameplay — menu closed) ──
-// Timing/counting design reverse-engineered from a comparable third-party
-// FPS-counter plugin by disassembling its binary directly with psp-objdump/
-// prxtool — NID lookups resolved against
-// PSP_References/ARK-4-main/contrib/psplibdoc_660.xml. The prior sceRtc-based
-// version of this hook left g_fps_value stuck at 0 in testing; this replaces
-// the timing source and counting logic to match a scheme confirmed to work
-// via that disassembly, not what the old comment here assumed.
-//
 // Hooks FIVE kernel functions by NID via sctrlHENFindFunction +
 // sctrlHENPatchSyscall, tail-calling through to the real originals afterward:
 //   module "sceDisplay_Service", library "sceDisplay":
@@ -34,53 +27,34 @@
 // banner); this draws on every REAL frame while the game keeps running
 // normally, so it must stay cheap.
 //
-// FPS timing uses sceKernelGetSystemTimeLow() (confirmed via the decompiled
-// reference plugin's import table: it calls ThreadManForKernel NID
-// 0x369ED59D for every tick), NOT sceRtc.
-//
 // A "tick" (fps_tick(), one countable frame-advance event) comes from a
-// 3-tier cascade, each tier only ticking once the one above it has gone
-// quiet — confirmed on real hardware that a game can silently stop calling
-// EITHER SetFrameBuf (adaptive single-buffering under heavy render load —
-// nothing to swap, so no reason to call it) or the vblank waits, while still
-// rendering normally, so relying on just one signal isn't reliable:
-//   Tier 1 — SetFrameBuf: ticks on EVERY call, no address-change requirement
-//     (confirmed via the reference plugin's own decompiled hook: it stores
-//     the incoming address unconditionally and ticks every call — some games
-//     call this every frame with the SAME address, which an earlier
-//     "only tick if the address changed" version of this hook silently
-//     discarded as "not a new frame"). Updates g_fps_recent_setfb_time/
-//     _count, read by tiers 2 and 3 below.
+// 3-tier cascade, each tier only ticking once the one above it has gone quiet:
+//   Tier 1 — SetFrameBuf: ticks on EVERY call, no address-change requirement.
+//     Updates g_fps_recent_setfb_time/_count, read by tiers 2 and 3 below.
 //   Tier 2 — WaitVblankStart/StartCB: ticks only when SetFrameBuf hasn't
 //     fired at least 3 times in the trailing ~200ms (g_fps_recent_setfb_time/
 //     _count) — lets a game that's stopped calling SetFrameBuf still get
 //     ticks from vblank instead. Updates g_fps_recent_vblank_time, read by
 //     tier 3.
-//   Tier 3 — sceGeListEnQueue/EnQueueHead: the one kernel primitive EVERY
-//     rendering technique must call to get anything drawn at all (sceGu is a
-//     pure user-mode wrapper around it — no way to bypass it), so it's the
-//     universal fallback for a game that's gone silent on BOTH tiers 1 and 2.
-//     Only ticks once tier 1 AND tier 2 have both been quiet for a while (see
-//     fps_maybe_tick_from_ge) — a game can legitimately submit several GE
-//     lists per visual frame, so this must never fire alongside a working
-//     tier 1/2 or it over-counts.
-// Each tick feeds a sliding window whose length is g_show_fps_overlay's mode
-// (1/0.5/0.2s, see fps_window_us()): once now - windowStart >= that length,
+//   Tier 3 — sceGeListEnQueue/EnQueueHead: universal fallback for a game gone
+//     silent on BOTH tiers 1 and 2. Only ticks once tier 1 AND tier 2 have
+//     both been quiet for a while (see fps_maybe_tick_from_ge) — a game can
+//     legitimately submit several GE lists per visual frame, so this must
+//     never fire alongside a working tier 1/2 or it over-counts.
+// Each tick feeds a sliding window whose length is the FPS update rate
+// (g_fps_rate, 0.1..1.0s; see fps_window_us()): once now - windowStart >= that length,
 // fps = ticksInWindow * 1,000,000 / elapsed, then the window resets. Deltas
 // closer together than FPS_REPRESENT_FLOOR_US are discarded as the same frame
-// presented twice (see fps_tick) — this filters GTA's 3-5ms glitch re-present and
-// Tomb Raider's 3-11ms thread/interrupt present pair.
+// presented twice (see fps_tick).
 //
 // 1% Low (g_fps_show_lows): every accepted tick's frametime (the delta itself,
-// in microseconds) is pushed into a 256-entry ring buffer — big enough to
-// cover several real seconds of gameplay at 30-60fps while staying tiny in
-// RAM. Sorting/scanning that buffer every single tick would cost real CPU, so
-// it's only rescanned once per real second (g_fps_lows_last_calc_us),
-// independent of the main FPS display's own window length. Each rescan pulls
-// out the slowest 1% of recorded frametimes (~3 of 256), averages THOSE
-// frametimes, then converts that average back to an FPS figure — the
-// standard "worst 1% of frames" stutter metric (same idea as MSI Afterburner's
-// 1% Low, just working in microsecond frametimes instead of milliseconds).
+// in microseconds) is pushed into a 256-entry ring buffer. Sorting/scanning
+// that buffer every single tick would cost real CPU, so it's only rescanned
+// once per real second (g_fps_lows_last_calc_us), independent of the main FPS
+// display's own window length. Each rescan pulls out the slowest 1% of
+// recorded frametimes (~3 of 256), averages THOSE frametimes, then converts
+// that average back to an FPS figure — the standard "worst 1% of frames"
+// stutter metric.
 //
 // All state explicitly zeroed in install_fps_overlay_hook() below, NOT trusted
 // to "= 0" static initializers: GCC commonly folds explicit-zero statics into
@@ -114,15 +88,9 @@ u32 g_fps_lows_last_calc_us;                   // fps_calc_1pct_low(): last reca
 static int g_fps_low1_value;                          // final computed 1% Low FPS — what gets drawn
 
 // Frametime histogram: one column per frame, full display width. 8.333ms is the
-// 1px baseline and frametime ABOVE it grows the bar at 1.25ms/px. Examples:
-// 70fps(14.3ms)->~6px, 60fps->~7px, 30fps->21px; ~107ms pegs.
-// NOTE the baseline is now a pure display scale, NOT the arrival floor: it used to
-// equal fps_tick's 8333us discard, so 1px really was the fastest frame that could
-// reach the chart. FPS_REPRESENT_FLOOR_US has since moved to 12ms, so the shortest
-// delta that arrives here is ~12ms (~4px) and 1px-3px columns no longer occur. The
-// scale is deliberately left at 8333/1.25ms-per-px so bar heights stay as tuned.
-// A 1px minimum keeps every column visible (no 0px gaps). g_ft_chart[0] is
-// leftmost/oldest, [FT_CHART_W-1] is newest; each tick shifts left and appends.
+// 1px baseline and frametime ABOVE it grows the bar at 1.25ms/px. A 1px minimum
+// keeps every column visible (no 0px gaps). g_ft_chart[0] is leftmost/oldest,
+// [FT_CHART_W-1] is newest; each tick shifts left and appends.
 #define FT_CHART_W     480    // PSP's fixed display width (not the buffer stride)
 #define FT_CHART_MAX_H 80     // clamp — a stall past this (~107ms) still visibly "pegged"
 static u8 g_ft_chart[FT_CHART_W];
@@ -150,23 +118,31 @@ void ft_chart_tick(u32 delta_us)
 	g_ft_chart_bound[FT_CHART_W - 1] = bound;
 }
 
-// Bars grow up from the bottom row of the display, one column at a time —
-// drawn fresh every call (only the bar pixels are written, so the game shows
-// through everywhere else, same as the rest of this overlay). Colored per
+// Bars grow AWAY from whichever edge they're anchored to, one column at a
+// time — drawn fresh every call (only the bar pixels are written, so the
+// game shows through everywhere else, same as the rest of this overlay).
+// Anchor mirrors g_overlay_pos but on the OPPOSITE edge from the text block:
+// Up modes (text at top) anchor the chart to the bottom edge, baseline row
+// 271, bars growing upward — the original layout. Down modes (text at
+// bottom) anchor the chart to the TOP edge instead, baseline row 0, bars
+// growing downward (flipped) — this keeps the chart clear of the bottom-
+// anchored text without needing to reserve space for it there. Colored per
 // column by g_ft_chart_bound: OVERLAY_BLUE (CPU-bound) / OVERLAY_ORANGE
 // (GPU-bound) / OVERLAY_FG (no data — CPU Usage was off) — see its own
 // comment above ft_chart_tick.
 void ft_chart_draw(void)
 {
 	int x, y, w = (FT_CHART_W < dbg_bufw) ? FT_CHART_W : dbg_bufw;
-	int baseline = 271;
+	int flip = (g_overlay_pos >= 2);   // Down: chart anchors the top edge, bars grow downward
+	int baseline = flip ? 0 : 271;
+	int dir = flip ? 1 : -1;           // row step per unit of bar height
 	if (dbg_pfmt == PSP_DISPLAY_PIXEL_FORMAT_8888) {
 		volatile u32 *base = (volatile u32 *)dbg_fb + baseline * dbg_bufw;
 		for (x = 0; x < w; x++) {
 			int h = g_ft_chart[x];
 			u32 c = (g_ft_chart_bound[x] == FT_BOUND_GPU) ? OVERLAY_ORANGE
 			      : (g_ft_chart_bound[x] == FT_BOUND_CPU) ? OVERLAY_BLUE : OVERLAY_FG;
-			for (y = 0; y < h; y++) base[x - y * dbg_bufw] = c;
+			for (y = 0; y < h; y++) base[x + dir * y * dbg_bufw] = c;
 		}
 	} else {
 		u16 cpu16 = pack16_fmt(OVERLAY_BLUE, dbg_pfmt);
@@ -177,19 +153,19 @@ void ft_chart_draw(void)
 			int h = g_ft_chart[x];
 			u16 c = (g_ft_chart_bound[x] == FT_BOUND_GPU) ? gpu16
 			      : (g_ft_chart_bound[x] == FT_BOUND_CPU) ? cpu16 : none16;
-			for (y = 0; y < h; y++) base[x - y * dbg_bufw] = c;
+			for (y = 0; y < h; y++) base[x + dir * y * dbg_bufw] = c;
 		}
 	}
 }
 
-// g_show_fps_overlay: 1/2/3 -> 1s/0.5s/0.2s averaging window (see the global's
-// own comment). Anything else (0, or an out-of-range settings.cfg value) falls
-// back to 1s — fps_tick() is only reached at all when the overlay is on.
+// Averaging window = g_fps_rate in 0.1s units (1..10 = 0.1..1.0s), set with
+// Triangle/X on the settings menu's Show FPS row. Out-of-range (corrupt
+// settings.cfg) falls back to 1s — fps_tick() is only reached at all when the
+// overlay is on.
 u32 fps_window_us(void)
 {
-	if (g_show_fps_overlay == 3) return 200000;
-	if (g_show_fps_overlay == 2) return 500000;
-	return 1000000;
+	int r = (g_fps_rate >= 1 && g_fps_rate <= 10) ? g_fps_rate : 10;
+	return (u32)r * 100000;   // 0.1s units -> µs (0.1..1.0s)
 }
 
 // Pulls the slowest FPS_LOW_K frametimes out of the ring buffer (a running
@@ -225,27 +201,14 @@ void fps_calc_1pct_low(u32 now)
 }
 
 // Re-present floor: a present closer than this to the last counted one is the SAME
-// frame shown twice, not a new frame. Sized from measured re-present gaps, and bounded
-// above by the fastest real frametime any game here produces:
-//   GTA        glitch re-present  3-5ms   -> caught
-//   Tomb Raider re-present        3-11ms  (v650 [FLD]: max bucket 12, nothing at 14)
-//                                         -> caught; it presents each frame twice, once
-//                                            from its thread and once from a vblank
-//                                            interrupt, and the gap grows with render time
-//   real frames                   60fps = 16.7ms, Tron ~70fps = 14.3ms -> counted
-// 8333 (a 120fps frametime) was the old value and was chosen as a round number, not from
-// GTA's actual 3-5ms glitch — it sat BELOW Tomb Raider's re-present gap, so whenever
-// render time pushed that gap past 8.33ms both presents counted and a capped 30fps game
-// read 51 (v650, ~10% of seconds). CEILING: this undercounts any game faster than 83fps
-// (12ms frames). Tron at ~70fps is the fastest measured here, leaving ~19% margin.
+// frame shown twice, not a new frame.
 #define FPS_REPRESENT_FLOOR_US 12000
 
 void fps_tick(u32 now)
 {
 	if (g_fps_last_tick_us != 0) {
 		u32 delta = now - g_fps_last_tick_us;
-		// Discard a re-present of the frame already counted — see
-		// FPS_REPRESENT_FLOOR_US for how the threshold is sized and what it costs.
+		// Discard a re-present of the frame already counted (FPS_REPRESENT_FLOOR_US).
 		// Returning before g_fps_last_tick_us is updated merges the re-present into
 		// its real frame rather than restarting the clock from it.
 		if (delta < FPS_REPRESENT_FLOOR_US) return;
@@ -268,13 +231,11 @@ void fps_tick(u32 now)
 }
 
 // ── CPU Usage overlay ───────────────────────────────────────────────────────
-// Same technique as PSP-HUD's getCpuUsage() (PSP_References/PSP-HUD-master/
-// hud/main.c): sceKernelReferSystemStatus() reports idleClocks, the running
-// total of CPU clocks spent in the kernel's idle thread; comparing its delta
-// against the elapsed wall-clock delta (sceKernelGetSystemTimeLow(), the same
-// timer fps_tick already uses) over a >=1s window gives load% without ever
-// touching a hardware register — cheap enough to run inline on
-// fps_poll_thread rather than needing battery_poll_thread's dedicated thread.
+// sceKernelReferSystemStatus() reports idleClocks, the running total of CPU
+// clocks spent in the kernel's idle thread; comparing its delta against the
+// elapsed wall-clock delta (sceKernelGetSystemTimeLow(), the same timer
+// fps_tick already uses) over a >=1s window gives load% without ever touching
+// a hardware register — cheap enough to run inline on fps_poll_thread.
 static u32 g_cpu_last_clock_us;   // 0 = no baseline yet
 static u32 g_cpu_last_idle_us;
 int g_cpu_usage_pct = -1;   // -1 = not yet sampled (first ~1s after enabling)
@@ -298,7 +259,7 @@ void cpu_usage_tick(u32 now)
 {
 	SceKernelSystemStatus status;
 	u32 idle_now;
-	if (g_cpu_last_clock_us != 0 && (now - g_cpu_last_clock_us) < fps_window_us()) return;   // update at the FPS window rate (1/0.5/0.2s), not a fixed 1s
+	if (g_cpu_last_clock_us != 0 && (now - g_cpu_last_clock_us) < fps_window_us()) return;   // update at the FPS window rate (0.1..1.0s), not a fixed 1s
 	status.size = sizeof(status);
 	sceKernelReferSystemStatus(&status);
 	idle_now = status.idleClocks.low;
@@ -328,23 +289,9 @@ void cpu_usage_tick(u32 now)
 }
 
 // ── Battery Status overlay ──────────────────────────────────────────────────
-// Values grounded in PSP_References/pspsdk-master/src/power/psppower.h (the
-// high-level scePower* calls, already linked via -lpsppower and declared
-// through pspfatsave.h's <psppower.h> include — no runtime resolution needed)
-// and PSP_References/uofw-master/include/syscon.h (the lower-level
-// sceSyscon_driver battery commands, resolved at runtime like every other raw
-// NID lookup in this file). Percent (0-100) and LifeTime (minutes) are the
-// only two fields psppower.h documents a concrete unit for; RemainCapacity/
-// FullCapacity are documented in mAh. Neither reference tree documents a unit
-// for Temp/Volt/Current/Cycle/LimitTime/ChargeTime — the units below (mV, °C,
-// mA) are the USER's own hardware-observed readings on their console, not
-// something confirmed against uofw/pspsdk source; Cycle/LimitTime/ChargeTime
-// still have no confirmed unit at all, shown as plain numbers. Power (mW) is
-// OUR OWN derived value (Volt_mV * Current_mA / 1000), not a separate query.
-// scePowerGetBatteryElec is deliberately NOT called: pspsdk's own header
-// documents it as "crashes PSP in usermode" (psppower.h). The ALL tier uses
-// sceSysconBatteryGetElec instead (a different code path, not flagged as
-// crash-prone) as a best-effort substitute for current-draw telemetry.
+// Percent (0-100) and LifeTime (minutes) come from scePower* calls;
+// RemainCapacity and FullCapacity are in mAh. Power (mW) is OUR OWN derived
+// value: Volt_mV * Current_mA / 1000, not a separate query.
 static int g_batt_exists   = 0;
 static int g_batt_ac       = 0;
 static int g_batt_charging = 0;
@@ -353,21 +300,29 @@ static int g_batt_percent  = -1;   // -1 = not read yet / no battery
 static int g_batt_life_min = -1;
 static int g_batt_remain_mah = 0;
 static int g_batt_full_mah   = 0;
-static int g_batt_temp_c     = 0;    // user-confirmed on their hardware, not documented in the refs
-static int g_batt_volt_mv    = 0;    // user-confirmed on their hardware, not documented in the refs
-static int g_batt_current_ma = 0;    // via sceSysconBatteryGetElec, best-effort; negative = discharging
+static int g_batt_temp_c     = 0;    // battery temp in °C
+static int g_batt_volt_mv    = 0;    // battery voltage in mV
+static int g_batt_current_ma = 0;    // via sceSysconBatteryGetElec; negative = discharging
 
-// sceSyscon_driver battery NIDs (uofw syscon.h/exports.exp) — resolved once,
-// same sctrlHENFindFunction("sceSYSCON_Driver", "sceSyscon_driver", ...) pair
-// uart.c's g_hrpower already uses successfully in this codebase.
+// sceSyscon_driver battery NIDs — resolved once via sctrlHENFindFunction.
 static int (*g_syscon_batt_current)(int *) = NULL;
-// scePowerGetBatteryRemainCapacity/FullCapacity ARE declared in psppower.h and
-// documented there (mAh) — but this toolchain's installed libpsppower.a turned
-// out to only carry a stub for RemainCapacity, not FullCapacity (link error on
-// the direct call). Resolved at runtime instead, like the syscon calls above,
-// so neither depends on what a given toolchain's static import library has.
+// Resolved at runtime rather than linked, so neither depends on what a given
+// toolchain's static import library has.
 static int (*g_power_remain_cap)(void) = NULL;
 static int (*g_power_full_cap)(void)   = NULL;
+// Charge gate (Stop-Charging setting): scePowerBatteryForbidCharging /
+// PermitCharging (scePower_Service/scePower_driver NIDs from ARK-4's nidmap).
+// These are the firmware's own charge on/off switches (they end up in
+// sceSysconCtrlCharge, syscon cmd 0x56 — the ONLY charge control the syscon
+// protocol exposes; there is no "set charge current" command). Resolved lazily
+// alongside the other battery functions.
+static int (*g_power_forbid_chg)(void) = NULL;
+static int (*g_power_permit_chg)(void) = NULL;
+// Tracks what we last TOLD the firmware, so the poll thread only writes on a
+// change (each call is a syscon transaction) and so a threshold change or a
+// re-permit is a deliberate transition, not a per-poll hammering. -1 = unknown
+// (nothing sent yet this session).
+static int g_chg_gate_sent = -1;
 
 static void battery_resolve_syscon(void)
 {
@@ -377,19 +332,37 @@ static void battery_resolve_syscon(void)
 	g_syscon_batt_current = (int (*)(int *))sctrlHENFindFunction("sceSYSCON_Driver", "sceSyscon_driver", 0x483088B0);
 	g_power_remain_cap    = (int (*)(void))sctrlHENFindFunction("scePower_Service", "scePower_driver", 0x94F5A53F);
 	g_power_full_cap      = (int (*)(void))sctrlHENFindFunction("scePower_Service", "scePower_driver", 0xFD18A0FF);
+	g_power_forbid_chg    = (int (*)(void))sctrlHENFindFunction("scePower_Service", "scePower_driver", 0x166922EC);
+	g_power_permit_chg    = (int (*)(void))sctrlHENFindFunction("scePower_Service", "scePower_driver", 0xDD3D4DAC);
+}
+
+// Applies the Stop-Charging threshold (g_batt_stop_charge: 0=OFF, 100=ON/never
+// charge, else 70..95). Called ONLY from battery_poll_thread (the calls are real
+// syscon transactions). OFF -> always permit (and only if we previously forbade).
+// ON -> always forbid. Threshold set -> forbid at/above it, permit below it.
+// g_chg_gate_sent makes each transition a single write, and lets a threshold
+// change re-evaluate immediately.
+static void battery_charge_gate(void)
+{
+	int want;
+	if (!g_power_forbid_chg || !g_power_permit_chg) return;
+	if (g_batt_stop_charge <= 0) {
+		want = 0;   // permit
+	} else if (g_batt_stop_charge >= 100) {
+		want = 1;   // ON: never charge
+	} else {
+		want = (g_batt_percent >= g_batt_stop_charge) ? 1 : 0;   // 1 = forbid
+	}
+	if (want == g_chg_gate_sent) return;
+	if (want) g_power_forbid_chg(); else g_power_permit_chg();
+	g_chg_gate_sent = want;
 }
 
 // Queries the firmware/syscon directly — real hardware bus transactions, not
 // cheap RAM reads, so this only ever runs from battery_poll_thread's own slow
 // loop (see there), never from anything drawing-related. remain_mah/full_mah/
-// current_ma are queried from the Percent+Time tier up (g_show_battery>=2) —
-// the Time slot's charge-time-to-full calc in battery_draw needs them; temp/
-// volt stay gated to g_show_battery==3 only, since nothing below that tier
-// displays them. (chgtime — a second raw syscon bus call, same cost class as
-// current — was removed here: it was never displayed by anything, confirmed
-// as the actual source of a ~10% CPU cost the user measured specifically on
-// the ALL tier, since it was the one extra hardware-bus call ALL added over
-// Percent+Time; temp/volt are cheap high-level scePower calls, not the cause.)
+// current_ma are queried from the Percent+Time tier up (g_show_battery>=2);
+// temp/volt stay gated to g_show_battery==3 only.
 void battery_refresh(void)
 {
 	g_batt_exists = scePowerIsBatteryExist();
@@ -411,35 +384,30 @@ void battery_refresh(void)
 }
 
 // ── Dedicated battery-poll thread — fully decoupled from fps_poll_thread ──
-// battery_refresh's sceSyscon* calls are real hardware bus transactions to the
-// battery's fuel-gauge chip (not cheap RAM reads like fps_tick/fps_value) —
-// the ALL tier fires 6+ of them back-to-back, and each can plausibly cost
-// tens of milliseconds. Calling that from ANYWHERE inside fps_poll_thread
-// blocks the OVERLAY DRAW thread itself for that whole stretch, no matter
-// which side of the vblank-sync call it sits on — the thread can't service
-// its precise vblank timing while it's stuck waiting on the battery chip, so
-// the overlay visibly stalls/blinks once per refresh regardless of the exact
-// call site (both tried, both still stalled). The actual fix is what the user
-// suggested from the start: capture the values on a genuinely SEPARATE
-// thread, at its own pace, into plain cached ints; battery_draw (called from
-// fps_draw, same as always) only ever reads those, same as it reads
-// g_fps_value — it never queries anything itself, so it can never block.
+// battery_refresh's sceSyscon* calls are real hardware bus transactions, so
+// they run here at this thread's own pace and cache the results into plain
+// ints. battery_draw (called from fps_draw) only ever reads those cached
+// values — it never queries anything itself.
 int g_battery_poll_started = 0;
 int battery_poll_thread(SceSize args, void *argp)
 {
 	(void)args; (void)argp;
 	while (1) {
-		if (!g_show_battery) {
+		// Exit only when there is NOTHING to do: overlay off AND no Stop-Charging
+		// threshold. A threshold alone keeps this thread alive so the gate keeps
+		// being enforced even with the battery overlay off.
+		if (!g_show_battery && g_batt_stop_charge <= 0) {
+			// Leaving with charging forbidden would leave the PSP never charging
+			// after the overlay is turned off — always re-permit on the way out.
+			if (g_chg_gate_sent == 1 && g_power_permit_chg) { g_power_permit_chg(); g_chg_gate_sent = 0; }
 			g_battery_poll_started = 0;   // mirrors fps_poll_thread's own clean-exit pattern
 			sceKernelExitDeleteThread(0);
 			return 0;
 		}
 		battery_refresh();
-		// Reuses the Show FPS interval (1s/0.5s/0.2s, falls back to 1s with FPS
-		// off) rather than a separate battery-only setting — no real reason for
-		// the two to differ. This thread just sleeps between queries; it isn't
-		// on anyone's timing budget, so blocking here for however long the
-		// hardware transactions take is completely harmless.
+		battery_charge_gate();
+		// Reuses the Show FPS interval rather than a separate battery-only
+		// setting. This thread just sleeps between queries.
 		sceKernelDelayThread(fps_window_us());
 	}
 	return 0;
@@ -447,9 +415,7 @@ int battery_poll_thread(SceSize args, void *argp)
 
 // Lazily starts battery_poll_thread — mirrors fps_poll_ensure_started exactly
 // (see its own comment), just for the battery thread instead of the overlay
-// draw thread. Low priority (64, well below the overlay thread's 32) and a
-// bit more stack (3KB: the syscon/scePower call chains aren't ours to verify)
-// since this thread never needs to keep up with anything time-critical.
+// draw thread. Low priority (64, well below the overlay thread's 32).
 void battery_poll_ensure_started(void)
 {
 	if (g_battery_poll_started) return;
@@ -468,18 +434,6 @@ void battery_poll_ensure_started(void)
 // to the space glyph (index 0) for anything not covered (safe blank, never
 // garbage). Row format: each byte's top 5 bits (128>>j for j=0..4) are that
 // row's 5 pixels, MSB = leftmost; the bottom 3 bits are always 0 (unused).
-//
-// Every glyph is transcribed from PSP-HUD's small_font[][10]
-// (PSP_References/PSP-HUD-master/hud/draw.c; that tree has no LICENSE file,
-// no copyright header in any source file, and no license mention anywhere
-// in its README) — its 7-wide cell's columns 1-5 (the outer border columns
-// are always background) mapped 'x'->1 bit, else->0. An earlier draft used
-// an independently hand-drawn font, then hand-drew lowercase l/m/n/o/s/t/y
-// once PSP-HUD's own small font turned out to stop at 'k' — both looked
-// wrong on hardware (baseline misaligned, "Limit" read as garbled). Rather
-// than keep guessing at glyph shapes with no source to check against, every
-// HUD string is now uppercase-only so every glyph here traces back to real
-// PSP-HUD data — no hand-drawn shapes left in this table at all.
 static const u8 g_small_font[37][7] = {
 	{0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // ' ' (0)
 	{0x00,0x00,0x90,0x20,0x40,0x90,0x00}, // '%' (1)
@@ -554,14 +508,9 @@ static int small_bit(const u8 *glyph, int r, int c)
 // Pre-baked black-halo mask, one per glyph, over the same 9-row (r=-1..7) x
 // 7-col (c=-1..5) draw region small_putchar rasterizes. Bit (128>>(c+1)) of
 // row [r+1] is set iff pixel (r,c) is a halo pixel — a background pixel that
-// touches the glyph via 8-neighbour dilation. The dilation is a pure function
-// of the fixed g_small_font shapes above, so it's computed OFFLINE (scratchpad
-// bake_halo.py, mirroring the exact dilation the old inline loop did) and stored
-// here as constant data — the PSP never computes it. This replaces a per-pixel
-// 8-neighbour probe inside small_putchar that dominated the overlay-draw cost;
-// each pixel is now a single mask-bit test. Kept SEPARATE from the glyph table
-// because the two carry different colours (glyph = runtime dbg_fg, e.g. red on
-// low battery; halo = always black) and so can't share one bitmap.
+// touches the glyph via 8-neighbour dilation. Kept SEPARATE from the glyph
+// table because the two carry different colours (glyph = runtime dbg_fg;
+// halo = always black).
 static const u8 g_small_halo[37][9] = {
 	{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // ' ' (0)
 	{0x00,0x00,0xFC,0xB4,0xEC,0xDC,0xB4,0xFC,0x00}, // '%' (1)
@@ -608,15 +557,13 @@ static const u8 g_small_halo[37][9] = {
 // dbg_pfmt/dbg_fg/dbg_bg/dbg_transparent globals every other draw primitive
 // in this file does, just with its own geometry.
 //
-// Every fg pixel gets a 1px black halo (8-neighbor dilation of the glyph's
-// own lit pixels, computed fresh per draw so it always matches whatever the
-// glyph shape actually is) so the text stays readable over any game
-// background — this is what makes this readable-over-gameplay overlay work
-// regardless of dbg_transparent; halo pixels are forced black even when
-// dbg_transparent is set (true background pixels, i.e. neither fg nor halo,
-// still honor dbg_transparent/dbg_bg as before). Draw region is therefore
-// 7x9 (one halo pixel beyond each glyph edge), each pixel bounds-checked
-// individually rather than aborting the whole glyph near screen edges.
+// Every fg pixel gets a 1px black halo (from the pre-baked g_small_halo mask)
+// so the text stays readable over any game background; halo pixels are forced
+// black even when dbg_transparent is set (true background pixels, i.e. neither
+// fg nor halo, still honor dbg_transparent/dbg_bg as before). Draw region is
+// therefore 7x9 (one halo pixel beyond each glyph edge), each pixel
+// bounds-checked individually rather than aborting the whole glyph near screen
+// edges.
 static void small_putchar(int px, int py, char ch)
 {
 	int r, c;
@@ -668,6 +615,24 @@ static void small_text(int px, int py, u32 fg, u32 bg, const char *s)
 	}
 }
 
+// ── Overlay anchor helpers (g_overlay_pos: 0=Up Left .. 3=Down Right) ──────
+// Down modes anchor the WHOLE block on the bottom edge, keeping the same
+// top-to-bottom order as Up (FPS first, battery last); Right modes right-align
+// each line on the 480px display.
+static int ov_x(const char *s)
+{
+	int x = (g_overlay_pos & 1) ? 480 - (int)strlen(s) * 6 : 0;
+	return (x < 0) ? 0 : x;   // clamp: an over-long line never starts past the edge
+}
+// Line count battery_draw will emit — needed to size the block BEFORE drawing
+// it (bottom anchoring). Must mirror battery_draw's own branch structure.
+static int batt_line_count(void)
+{
+	if (!g_show_battery) return 0;
+	if (!g_batt_exists) return 1;
+	return (g_show_battery >= 3) ? 3 : 1;
+}
+
 // Draws the battery block starting at pixel row `y`; returns the next free
 // y (so fps_draw can stack FPS lines above it without a fixed offset), 8px
 // per line (the small font is 7px tall; +1px gap).
@@ -676,19 +641,22 @@ static void small_text(int px, int py, u32 fg, u32 bg, const char *s)
 // charging is conveyed by the time showing "--:--" rather than a separate
 // AC/Chg suffix. ALL tier: +2 more lines — capacity+temp, then a bare
 // volt/current/power line with no field labels at all (unit suffixes alone
-// identify each number, e.g. "3745 MV 450 MA 1.73 W"). Charging-timer line removed
-// (see the user request this matches). Pure cache read: no query, no
-// gating, drawn every call in whatever mode the caller (fps_draw) already
-// set — the actual refresh happens on the fully separate battery_poll_thread,
-// never on this draw path.
+// identify each number, e.g. "3745 MV 450 MA 1.73 W"). Pure cache read: no
+// query, no gating, drawn every call in whatever mode the caller (fps_draw)
+// already set — the actual refresh happens on the fully separate
+// battery_poll_thread, never on this draw path.
 int battery_draw(int y)
 {
 	char buf[40];
 	if (!g_show_battery) return y;
-	if (!g_batt_exists) { small_text(0, y, OVERLAY_FG, BR_BG, "BATT: NONE"); return y + 8; }
+	if (!g_batt_exists) { small_text(ov_x("BATT: NONE"), y, OVERLAY_FG, BR_BG, "BATT: NONE"); return y + 8; }
 
 	{
 		u32 fg = g_batt_low ? 0xFF0000FF : OVERLAY_FG;   // red when the firmware itself flags low battery
+		// Scale the BMS minutes by real/full (1x when no override or full unknown).
+		// Overflow-safe: minutes*8000 fits u32.
+		int sc_num = 1, sc_den = 1;
+		if (g_batt_real_mah > 0 && g_batt_full_mah > 0) { sc_num = g_batt_real_mah; sc_den = g_batt_full_mah; }
 		if (g_show_battery == 1) {
 			sprintf(buf, "%d%%", g_batt_percent);
 		} else if (g_batt_ac || g_batt_charging) {
@@ -696,6 +664,7 @@ int battery_draw(int y)
 			int target_mah = g_batt_full_mah - (g_batt_full_mah / 10);
 			if (g_batt_current_ma > 0 && target_mah > g_batt_remain_mah) {
 				int min_left = ((target_mah - g_batt_remain_mah) * 60) / g_batt_current_ma;
+				min_left = (int)((u32)min_left * (u32)sc_num / (u32)sc_den);   // scale to the real cell
 				sprintf(buf, "%d%% %d:%02d", g_batt_percent, min_left / 60, min_left % 60);
 			} else {
 				sprintf(buf, "%d%% --:--", g_batt_percent);
@@ -703,34 +672,52 @@ int battery_draw(int y)
 		} else if (g_batt_life_min < 0) {
 			sprintf(buf, "%d%% --:--", g_batt_percent);
 		} else {
-			sprintf(buf, "%d%% %d:%02d", g_batt_percent, g_batt_life_min / 60, g_batt_life_min % 60);
+			int life = (int)((u32)g_batt_life_min * (u32)sc_num / (u32)sc_den);   // scale to the real cell
+			sprintf(buf, "%d%% %d:%02d", g_batt_percent, life / 60, life % 60);
 		}
-		small_text(0, y, fg, BR_BG, buf); y += 8;
+		small_text(ov_x(buf), y, fg, BR_BG, buf); y += 8;
 
-		// Charge-direction triangle: green up while charging, orange down otherwise.
-		if (g_show_battery >= 2) {
-			int arrow_x = (int)strlen(buf) * 6 + 1;
-			dbg_fg = g_batt_charging ? OVERLAY_GREEN : OVERLAY_ORANGE;
+		// Charge-direction triangle, driven by the ACTUAL battery current
+		// (sceSysconBatteryGetElec, mA; negative = discharging): >0 = charging
+		// (green up), <0 = discharging (orange down), 0 = no arrow at all
+		// (AC plugged in but battery idle/full, or current not readable).
+		// Deliberately NOT keyed off scePowerIsBatteryCharging(), which reports
+		// the firmware's charge state and can disagree with the real current
+		// flow. g_batt_current_ma is refreshed in the same tier (>=2) that
+		// draws this arrow, so the two always stay in sync.
+		if (g_show_battery >= 2 && g_batt_current_ma != 0) {
+			int arrow_x = ov_x(buf) + (int)strlen(buf) * 6 + 1;
+			int charging = g_batt_current_ma > 0;
+			dbg_fg = charging ? OVERLAY_GREEN : OVERLAY_ORANGE;
 			dbg_bg = BR_BG;
-			small_putchar(arrow_x, y - 8, g_batt_charging ? '^' : '_');
+			small_putchar(arrow_x, y - 8, charging ? '^' : '_');
 		}
 	}
 	if (g_show_battery <= 2) return y;   // Percent, or Percent + Time
 
-	sprintf(buf, "%d/%d MAH %d C", g_batt_remain_mah, g_batt_full_mah, g_batt_temp_c);
-	small_text(0, y, OVERLAY_FG, BR_BG, buf); y += 8;
 	{
-		// Power (mW) is OUR OWN derived value, not a separate query — see the
-		// block comment above battery_refresh. Sign follows Current (negative
-		// while discharging), matching the user's own hardware observation.
-		// Displayed as W with 2 decimals (hundredths of a watt = mW/10);
-		// fixed-point integer math, not %f — see the MB/s panel for why.
+		// Scale mAh to the real cell: show full = real capacity and
+		// remain = reported_remain * real / reported_full (percentage-preserving).
+		int disp_full   = g_batt_full_mah;
+		int disp_remain = g_batt_remain_mah;
+		if (g_batt_real_mah > 0 && g_batt_full_mah > 0) {
+			// 32-bit math (no 64-bit divide): remain*real <= ~2000*8000 fits in u32.
+			disp_full   = g_batt_real_mah;
+			disp_remain = (int)((u32)g_batt_remain_mah * (u32)g_batt_real_mah / (u32)g_batt_full_mah);
+		}
+		sprintf(buf, "%d/%d MAH %d C", disp_remain, disp_full, g_batt_temp_c);
+	}
+	small_text(ov_x(buf), y, OVERLAY_FG, BR_BG, buf); y += 8;
+	{
+		// Power (mW) is derived: Volt_mV * Current_mA / 1000. Sign follows Current
+		// (negative while discharging). Displayed as W with 2 decimals
+		// (hundredths of a watt = mW/10), fixed-point integer math, not %f.
 		int power_mw = (g_batt_volt_mv * g_batt_current_ma) / 1000;
 		int neg = power_mw < 0;
 		u32 p100 = (u32)((neg ? -power_mw : power_mw) / 10);
 		sprintf(buf, "%d MV %d MA %s%u.%02u W", g_batt_volt_mv, g_batt_current_ma,
 		        neg ? "-" : "", p100 / 100, p100 % 100);
-		small_text(0, y, OVERLAY_FG, BR_BG, buf); y += 8;
+		small_text(ov_x(buf), y, OVERLAY_FG, BR_BG, buf); y += 8;
 	}
 	return y;   // ALL
 }
@@ -744,28 +731,43 @@ void fps_draw(void *topaddr, int bufferwidth, int pixelformat)
 	dbg_pfmt = pixelformat;
 	{
 		char buf[40];
-		int y = 0;   // pixel row, 8px/line (small font is 7px tall + 1px gap) — see small_text
+		int nl = 0;   // overlay line count (8px/line) — sizes the block BEFORE drawing
+		int y;
+		if (g_show_fps_overlay) { nl++; if (g_fps_show_lows) nl++; }
+		if (g_show_cpu_usage && g_cpu_usage_pct >= 0) nl++;
+		nl += batt_line_count();
+		// Anchor (g_overlay_pos): Up modes start at row 0; Down modes sit the block
+		// on the bottom edge in the SAME order (FPS first, battery last). The
+		// frametime chart anchors the OPPOSITE edge from the text (see
+		// ft_chart_draw), so the two never share screen space and no extra
+		// offset is needed here to keep them apart.
+		y = (g_overlay_pos >= 2) ? 272 - nl * 8 : 0;
 		dbg_transparent = 1;   // glyph pixels only — bg param below is otherwise an opaque box
 		if (g_show_fps_overlay) {
 			sprintf(buf, "%d FPS", g_fps_value);
-			small_text(0, y, OVERLAY_FG, BR_BG, buf); y += 8;
+			small_text(ov_x(buf), y, OVERLAY_FG, BR_BG, buf); y += 8;
 			if (g_fps_show_lows) {
 				sprintf(buf, "%d 1%%", g_fps_low1_value);
-				small_text(0, y, OVERLAY_FG, BR_BG, buf); y += 8;
+				small_text(ov_x(buf), y, OVERLAY_FG, BR_BG, buf); y += 8;
 			}
 		}
 		if (g_show_cpu_usage && g_cpu_usage_pct >= 0) {
 			// Two separate calls so the bottleneck (g_perf_bound) can be
 			// highlighted (OVERLAY_BLUE=CPU, OVERLAY_ORANGE=GPU) while the
-			// other stays OVERLAY_FG. 6px/char advance positions the GPU text
-			// right after the CPU text.
+			// other stays OVERLAY_FG. Right modes align the COMBINED line: x0
+			// spans CPU + GPU text together (6px/char advance).
+			int x0;
 			sprintf(buf, "%d%% CPU", g_cpu_usage_pct);
-			small_text(0, y, (g_perf_bound == FT_BOUND_CPU) ? OVERLAY_BLUE : OVERLAY_FG, BR_BG, buf);
+			x0 = ov_x(buf);
 			if (g_gpu_usage_pct >= 0) {
-				int cpu_px = (int)strlen(buf) * 6;
-				sprintf(buf, " %d%% GPU", g_gpu_usage_pct);
-				small_text(cpu_px, y, (g_perf_bound == FT_BOUND_GPU) ? OVERLAY_ORANGE : OVERLAY_FG, BR_BG, buf);
+				char g2[24];
+				int off = (int)strlen(buf) * 6;
+				sprintf(g2, " %d%% GPU", g_gpu_usage_pct);
+				if (g_overlay_pos & 1) x0 = 480 - (off + (int)strlen(g2) * 6);
+				if (x0 < 0) x0 = 0;
+				small_text(x0 + off, y, (g_perf_bound == FT_BOUND_GPU) ? OVERLAY_ORANGE : OVERLAY_FG, BR_BG, g2);
 			}
+			small_text(x0, y, (g_perf_bound == FT_BOUND_CPU) ? OVERLAY_BLUE : OVERLAY_FG, BR_BG, buf);
 			y += 8;
 		}
 		battery_draw(y);
@@ -775,72 +777,27 @@ void fps_draw(void *topaddr, int bufferwidth, int pixelformat)
 }
 
 
-// NOTE: overlay draws are deliberately NOT throttled to the display rate. A
-// ~60Hz cap was tried (v640) and made GTA's overlay flicker: GTA is single-
-// buffered and re-presents the same live buffer (plus a ~4-7ms phantom present),
-// so the overlay only stays solid if it's redrawn on essentially every present —
-// capping the redraw rate lets the game overwrite it between draws. So every
-// present and both poll passes redraw; the cost is accepted for a stable overlay.
-
 // ── Frame limiter (PER-GAME, g_frame_limit) ─────────────────────────────────
-// Paces the game by sleeping in the GE-ENQUEUE hook, not the present hook: a frame is
-// PRODUCED by the game's thread submitting a render (sceGeListEnQueue), whereas
-// sceDisplaySetFrameBuf is only PRESENTATION and may not be the game's work at all.
+// Paces the game by sleeping in the GE-ENQUEUE hook: a frame is PRODUCED by
+// the game's thread submitting a render (sceGeListEnQueue), whereas
+// sceDisplaySetFrameBuf is only PRESENTATION.
 //
-// v643-v648 paced the present and it could not cap Tomb Raider, for a reason that is
-// now measured rather than guessed: TR presents heavily from INTERRUPT context (v646
-// [FLTID], via sceKernelGetThreadId returning 0x80020064 =
-// SCE_ERROR_KERNEL_CANNOT_BE_CALLED_FROM_INTERRUPT) — a vblank handler flipping the
-// buffer on the DISPLAY's schedule. A syscall-table patch (sctrlHENPatchSyscall) is
-// reachable that way; an earlier comment here claimed it could not be, which was wrong.
-// An interrupt cannot be slept, so those presents are unpaceable — and the ratio is
-// scene-dependent (TR logs 30 thread : 30 intr in one view, 20 : 39 in another), so
-// pacing the present gave a cap that came and went with the camera angle. Note the 20:39
-// case also disproves "an interrupt present is a re-present": there are MORE of them than
-// thread presents, so they carry real frames. Only the unsleepable part is true.
-// sceGeListEnQueue has neither problem — every rendering path must call it (sceGu is a
-// pure user-mode wrapper), and it is the game's own thread doing the work.
+// THE FRAME BOUNDARY IS THE GE SUBMIT — not the present. A GE submit sets
+// g_fl_pending and that is the only thing that ever does.
 //
-// THE FRAME BOUNDARY IS THE GE SUBMIT — not the present. "A present begins a new frame"
-// is false for Tomb Raider, which presents each frame TWICE (v653 [FLTID]: 10 thread +
-// 20 interrupt per second). v653 armed on every present and TR double-paced: the GE paced
-// the frame, the interrupt flip then re-armed mid-frame, and the thread present paced the
-// same frame again — cap=30 ge=15 paced=30 fps=14, i.e. a 30 cap delivering 15, worse than
-// no cap at all. The signal that is genuinely once-per-frame in both games is the render:
-// Tron uncapped ran ge=76 / fps=77, TR ran ge=30 / fps=29. So a GE submit sets g_fl_pending
-// and that is the only thing that ever does.
+// TWO sleep sites, one pending flag: the GE site marks the frame and tries
+// first; if its sleep is refused the frame stays pending and the present site
+// sleeps for it instead. A refused sleep is a total no-op — it must not touch
+// the anchor either, or the grid the other site inherits is corrupt.
 //
-// TWO sleep sites, one pending flag, because neither reaches both games and each fails for
-// exactly the game the other handles:
-//   Tomb Raider presents from a vblank INTERRUPT, which can never be slept — but its GE
-//               submits sleep fine (v650: ge=30 paced=30, a real 30fps). Paced at the GE.
-//   Tron        submits its GE lists with interrupts or dispatch disabled, so every sleep
-//               there is REFUSED — v653 measured fail=30 of ge=30, err=0x800201A7
-//               (SCE_ERROR_KERNEL_WAIT_CAN_NOT_WAIT, uofw common/errors.h:332). But it
-//               presents from its THREAD, and v644 paced it correctly from the present
-//               hook. Paced at the present.
-// So: the GE site marks the frame and tries first; if its sleep is refused the frame stays
-// pending and the present site sleeps for it instead. A refused sleep is a total no-op —
-// it must not touch the anchor either, or the grid the other site inherits is corrupt.
+// g_fl_anchor_us is the ideal grid point the cadence locks to. It advances by
+// exactly target_us whenever we waited, so DelayThread's overshoot is absorbed
+// rather than accumulating into drift; if the game is already slower than the
+// cap there is nothing to do and it resets to now.
 //
-// Neither the present hook nor the vblank hooks mark frames any more (the v652 vblank arm
-// is gone with them): a present cannot, per the TR result above, and the vblank arm existed
-// only to reach Tron's no-present windows, which is moot now that Tron's GE cannot sleep
-// anyway. Known limit: a game submitting SEVERAL GE lists per visual frame would pace once
-// per list. Not observed — both measured games are 1 GE per frame (see the ge=/fps= pairs
-// above) — but nothing here guards it.
-//
-// g_fl_anchor_us is the ideal grid point the cadence locks to. It advances by exactly
-// target_us whenever we waited, so DelayThread's overshoot is absorbed rather than
-// accumulating into drift; if the game is already slower than the cap there is nothing
-// to do and it resets to now.
-//
-// Panel timing: the LCD is NOT 60.000Hz. pspsdk documents the mode as 59.94005995Hz
-// (pspsdk-master/src/display/pspdisplay.h:44-52) => 16683.33us/vblank, so a 30 cap
-// of 1000000/30 = 33333us runs 33.67us/frame fast against the real 2-vblank grid of
-// 33366.67us and slips a whole vblank roughly every 496 frames — a hitch about every
-// 16s. g_fl_vblank_us takes the period from sceDisplayGetFramePerSec() instead (read
-// once at install, kept as an int: no float math on the game's thread).
+// Panel timing: the LCD is 59.94Hz (pspsdk pspdisplay.h), so g_fl_vblank_us
+// takes the period from sceDisplayGetFramePerSec() instead (read once at
+// install, kept as an int: no float math on the game's thread).
 #define GE_REFUSE_LATCH 8        // consecutive GE-site refusals before we stop attempting there
 u32 g_fl_anchor_us;       // ideal grid point (pacing only)
 static int g_fl_pending;         // a GE submit began a frame that has not been paced yet
@@ -859,17 +816,12 @@ static u32 g_fl_failed;          // [FLIMIT]: sleeps that returned an error inst
 static u32 g_fl_last_err;        // [FLIMIT]: last such error code
 static u32 g_fl_log_last_us;     // [FLIMIT]: last emit time
 
-// Period for a target rate, snapped to a whole-vblank multiple only when that rate
-// really is a refresh divisor (60 -> 16683, 30 -> 33367; also 20/15 if ever offered).
-// The 2.5% tolerance is load-bearing: it must reject any snap that would change the
-// rate the user asked for. 55 and 50 both sit within ONE vblank of 60fps, so a looser
-// window would silently turn either into a 60 cap.
-//
-// Rates with no whole-vblank period keep their exact period. Their frames must alternate
-// refresh counts — 40fps is 1.5 vblanks, so 2/1/2/1 — which is a real property of a
-// fixed-refresh panel, NOT a defect in the pacing. How visible that is on the PSP's 4.3"
-// 60Hz LCD is a separate question: tested by hand across the 20..60 range and reported as
-// feeling fine, so do not assume the non-divisor steps are unusable.
+// Period for a target rate, snapped to a whole-vblank multiple only when that
+// rate really is a refresh divisor (60 -> 16683, 30 -> 33367; also 20/15 if
+// ever offered). The 2.5% tolerance rejects any snap that would change the
+// rate the user asked for. Rates with no whole-vblank period keep their exact
+// period; their frames alternate refresh counts (40fps is 1.5 vblanks, so
+// 2/1/2/1).
 u32 frame_limit_target_us(int fps)
 {
 	u32 vb    = g_fl_vblank_us ? g_fl_vblank_us : 16683;
@@ -900,13 +852,9 @@ static void frame_limit_pace(int at_ge)
 	{
 		int r = sceKernelDelayThread(g_fl_target_us - elapsed);
 		if (r < 0) {
-			// Refused, not taken (Tron's GE submits: err=0x800201A7 WAIT_CAN_NOT_WAIT —
-			// interrupts or dispatch disabled). A TOTAL no-op on purpose: leave pending
-			// set so the other site sleeps for this same frame, and leave the anchor
-			// alone so that site inherits the same grid. Touching either here corrupts
-			// it — v652 advanced the anchor on a refused sleep, which pushed it ahead of
-			// real time, underflowed the next unsigned now-anchor, and produced the
-			// paced=ge/2 alternation with no actual delay at all.
+			// Refused, not taken (interrupts or dispatch disabled). A TOTAL no-op on
+			// purpose: leave pending set so the other site sleeps for this same frame,
+			// and leave the anchor alone so that site inherits the same grid.
 			g_fl_failed++;
 			g_fl_last_err = (u32)r;
 			if (at_ge && g_fl_ge_refused < GE_REFUSE_LATCH) g_fl_ge_refused++;
@@ -933,20 +881,17 @@ void frame_limit_ge(void)
 	// An interrupt cannot be slept in ANY game — a no-op where rendering is thread work.
 	if (sceKernelIsIntrContext()) { g_fl_intr++; return; }
 	// A NEW frame only if something has been presented since the last one we marked;
-	// otherwise this is another GE list of the frame already in flight. Games legitimately
-	// submit several lists per visual frame — a GE-heavy phase logged ge=4658 in one second
-	// (v652) — and pacing each would advance the grid ~155s per real second, stalling the
-	// game outright. g_fl_saw_present is a FLAG, so Tomb Raider's two presents per frame
-	// collapse into a single mark.
+	// otherwise this is another GE list of the frame already in flight. Games
+	// legitimately submit several lists per visual frame, and pacing each would
+	// advance the grid far ahead of real time, stalling the game. g_fl_saw_present
+	// is a FLAG, so multiple presents per frame collapse into a single mark.
 	if (g_fl_saw_present) { g_fl_saw_present = 0; g_fl_pending = 1; }
 	if (!g_fl_pending) { g_fl_extra++; return; }   // another list of the current frame
 	// Whether a game's GE site can sleep is a FIXED property of that game, so stop
-	// re-deriving it every frame. Tron refuses every single time (v653: fail=30 of ge=30,
-	// err=0x800201A7), and paying a clock read plus a doomed DelayThread per submit is
-	// pure waste — its GE-heavy phases hit ge=4658/sec (v652), i.e. ~9300 useless kernel
-	// calls in one second. Once latched, skip straight to the present site and re-probe
-	// only every 256th submit (~4/sec at 60fps) in case the game's context changes. The
-	// probe counter is used instead of a clock so the skip path costs no kernel call.
+	// re-deriving it every frame. Once latched, skip straight to the present site
+	// and re-probe only every 256th submit (~4/sec at 60fps) in case the game's
+	// context changes. The probe counter is used instead of a clock so the skip
+	// path costs no kernel call.
 	if (g_fl_ge_refused >= GE_REFUSE_LATCH) {
 		if (++g_fl_reprobe & 0xFF) return;
 		g_fl_ge_refused = 0;
@@ -954,26 +899,30 @@ void frame_limit_ge(void)
 	frame_limit_pace(1);
 }
 
-// From the END of the present hook — never before fps_tick, which needs untouched arrival
-// timestamps (v645 slept ahead of it and the counter read double). Does nothing unless the
-// GE site's sleep was refused, i.e. this is Tron. NOTE it must not mark frames: Tomb Raider
-// presents twice per frame, so treating a present as a boundary double-paced it (v653).
+// From the END of the present hook — never before fps_tick, which needs
+// untouched arrival timestamps. Does nothing unless the GE site's sleep was
+// refused. NOTE it must not mark frames: multiple presents per frame would
+// otherwise double-pace.
 static void frame_limit_present(void)
 {
 	if (g_menu_open) return;                         // frame_limit_ge owns the reset
-	// Mark that something reached the screen — from ANY context, since Tomb Raider's
-	// interrupt flip is still a real frame boundary even though it cannot be slept. This
-	// is what lets the next GE submit tell a NEW frame from another list of this one.
+	// Mark that something reached the screen — from ANY context. This is what lets
+	// the next GE submit tell a NEW frame from another list of this one.
 	g_fl_saw_present = 1;
 	if (!g_fl_pending) return;                       // the GE site already paced this frame
-	if (sceKernelIsIntrContext()) return;            // Tomb Raider's flip — unpaceable
+	if (sceKernelIsIntrContext()) return;            // interrupt flip — unpaceable
 	frame_limit_pace(0);
 }
 
 int fps_display_set_frame_buf_patched(void *topaddr, int bufferwidth, int pixelformat, int sync)
 {
+	// IPS gamma pass FIRST, before the CPU overlays below — the GE pass would
+	// re-curve their pixels if drawn under it. Handles its own enable/menu/intr
+	// gating (interrupt-context presents are deferred to its worker thread).
+	st_on_present(topaddr, bufferwidth, pixelformat);
+
 	// Intro-skip CAPTURE banner — see vskip_banner_draw. Drawn here for games that DO call
-	// SetFrameBuf, and from fps_poll_thread for games that don't (GTA/Pirates).
+	// SetFrameBuf, and from fps_poll_thread for games that don't.
 	if (g_vskip_banner && !g_menu_open && topaddr && bufferwidth > 0)
 		vskip_banner_draw(topaddr, bufferwidth, pixelformat);
 
@@ -990,59 +939,44 @@ int fps_display_set_frame_buf_patched(void *topaddr, int bufferwidth, int pixelf
 			}
 			g_fps_recent_setfb_time = now;
 
-			// Tick on every real call — address-independent (some games, e.g. GTA,
-			// present the SAME buffer every frame; an earlier "tick only if topaddr
-			// changed" version wrongly dropped those). GTA's ~4-7ms phantom re-present
-			// is filtered downstream by fps_tick's 120fps discard floor, not here.
+			// Tick on every real call — address-independent (some games present the
+			// SAME buffer every frame). A phantom re-present is filtered downstream by
+			// fps_tick's FPS_REPRESENT_FLOOR_US discard, not here.
 			//
-			// This MUST be reached with the ARRIVAL timestamp — see frame_limit_wait's
-			// call site below, which is deliberately after this block. An interrupt
-			// present is NOT filtered here: v648 tried that and undercounted by half.
-			// Tomb Raider's low-fps view logs 20 thread presents against 39 interrupt
-			// ones ([FLTID], v648) — 2:1, so most of its REAL frames are presented from
-			// the vblank handler, and dropping them read 19 for a ~40fps game. An
-			// interrupt present being a mere re-present is false in general; it is only
-			// true that it cannot be SLEPT (which is the limiter's problem, not this
-			// counter's). FPS_REPRESENT_FLOOR_US is what pairs a re-present with its
-			// frame, and on arrival times it does that correctly.
+			// This MUST be reached with the ARRIVAL timestamp — the sleep site below is
+			// deliberately after this block. FPS_REPRESENT_FLOOR_US pairs a re-present
+			// with its frame correctly on arrival times.
 			fps_tick(now);
 		}
 		fps_draw(topaddr, bufferwidth, pixelformat);
 	}
-	// Fallback sleep site, only for a frame whose GE submit refused to sleep (Tron). Runs
-	// after fps_tick above, never before it — fps_tick needs untouched ARRIVAL timestamps
-	// for FPS_REPRESENT_FLOOR_US to pair a re-present with its frame (v645 slept ahead of
-	// it and the counter read double). This does NOT mark a frame boundary: Tomb Raider
-	// presents twice per frame, so arming here double-paced it (v653: ge=15 paced=30
-	// fps=14 under a 30 cap). Only the GE submit marks frames. Inline OFF test, same
-	// reason as the GE call site. Skip during intro video skip to preserve video timing.
+	// Live gamma HUD on top of everything, and after st_on_present above so the
+	// banner itself never gets curved (see st_hud_draw).
+	if (g_st_hud && !g_menu_open && topaddr && bufferwidth > 0)
+		st_hud_draw(st_pops_hud_fb(topaddr), bufferwidth, pixelformat);
+	// Fallback sleep site, only for a frame whose GE submit refused to sleep. Runs
+	// after fps_tick above, never before it — fps_tick needs untouched ARRIVAL
+	// timestamps for FPS_REPRESENT_FLOOR_US to pair a re-present with its frame.
+	// This does NOT mark a frame boundary: only the GE submit marks frames. Inline
+	// OFF test, same reason as the GE call site. Skip during intro video skip to
+	// preserve video timing.
 	if (g_frame_limit > 0 && !g_vskip_active) frame_limit_present();
 	return g_real_display_set_frame_buf ? g_real_display_set_frame_buf(topaddr, bufferwidth, pixelformat, sync) : 0;
 }
 
-// Drawing from the SetFrameBuf/vblank HOOKS still didn't show the overlay
-// during actual GTA gameplay (only its pause menu) — those hooks only fire
-// when the game calls the specific syscall being hooked, and GTA apparently
-// doesn't call any of the three during real 3D gameplay. This thread doesn't
-// depend on the game calling anything: it asks the display controller
-// directly for whatever buffer is CURRENTLY live.
+// Drawing from the SetFrameBuf/vblank HOOKS only fires when the game calls
+// the specific syscall being hooked. This thread doesn't depend on the game
+// calling anything: it asks the display controller directly for whatever
+// buffer is CURRENTLY live.
 //
-// A fixed ~16ms sceKernelDelayThread poll (matching a comparable reference
-// plugin's own binary) still flickered in testing — confirmed NOT just the
-// opaque background (a separate, already-fixed bug), the digits themselves
-// were unstable. Draw TIMING (not FPS math — that stays exactly as
-// implemented above; a reference HUD-overlay plugin's own FPS number is
-// wrong, do not port that part) is adapted from that same reference plugin's
-// own draw loop: instead of a fixed delay, block on the REAL display vblank
-// via g_real_wait_vblank_start() directly (the resolved original, NOT the
-// hooked syscall — calling the hooked sceDisplayWaitVblankStart here would
-// re-enter fps_wait_vblank_start_patched and double-tick the FPS counter),
-// draw immediately, then measure how long that draw took and sleep the REST
-// of the vblank period (clamped to 10%-90% of it, same ratio that reference
-// plugin uses) before drawing a SECOND time just before the next real flip.
-// Two draws spread across the vblank period make it far more likely at least
-// one lands after the game's own GE has finished refreshing that buffer for
-// this cycle, instead of racing it once on a fixed timer.
+// Block on the REAL display vblank via g_real_wait_vblank_start() directly
+// (the resolved original, NOT the hooked syscall — calling the hooked
+// sceDisplayWaitVblankStart here would re-enter the patch and double-tick the
+// FPS counter), draw immediately, then measure how long that draw took and
+// sleep the REST of the vblank period (clamped to 10%-90% of it) before
+// drawing a SECOND time just before the next real flip. Two draws spread
+// across the vblank period make it more likely at least one lands after the
+// game's own GE has finished refreshing that buffer for this cycle.
 //
 // g_fps_poll_started tracks whether this thread currently exists at all (see
 // fps_poll_ensure_started() below) - declared up here since this loop clears
@@ -1090,12 +1024,8 @@ int fps_poll_thread(SceSize args, void *argp)
 			u32 t0 = sceKernelGetSystemTimeLow();
 			int got = (sceDisplayGetFrameBuf(&topaddr, &bufferwidth, &pixelformat, PSP_DISPLAY_SETBUF_IMMEDIATE) >= 0
 			           && topaddr && bufferwidth > 0);
-			// No tick here — this thread only draws whatever fps_tick (now
-			// correctly firing on every real SetFrameBuf call, see the hook
-			// above) has already computed. An address-based tick attempt here
-			// was tried and removed: it was solving the wrong problem
-			// (address-change detection) instead of the actual bug (the hook
-			// requiring an address change at all).
+			// No tick here — this thread only draws whatever fps_tick (firing on
+			// every real SetFrameBuf call, see the hook above) has already computed.
 			if (got) fps_draw(topaddr, bufferwidth, pixelformat);
 			if (got && g_vskip_banner) vskip_banner_draw(topaddr, bufferwidth, pixelformat);
 			{
@@ -1117,25 +1047,21 @@ int fps_poll_thread(SceSize args, void *argp)
 		}
 
 		// [FLIMIT] frame-limiter counters — drained HERE, on the poll thread, and never
-		// from the present or GE hooks: uart_puts is a blocking register write (~5.5ms
-		// for a 64-char line at 115200), which on the game's thread would perturb the
-		// very pacing it measures. Emitted after both draws above so the write cost
-		// lands between loop iterations rather than between the two draws (which is what
-		// the second draw exists to avoid — see above).
+		// from the present or GE hooks: uart_puts is a blocking register write, which
+		// on the game's thread would perturb the very pacing it measures. Emitted after
+		// both draws above so the write cost lands between loop iterations.
 		//
 		// How to read it for a game that will not cap:
 		//   ge=0            the GE hook never fires — nothing to pace against.
 		//   extra > 0       a MULTI-LIST game: it submits several GE lists per visual
-		//                   frame. Expected to be harmless (those lists are skipped), but
-		//                   this is the shape that would stall a game if the guard broke.
+		//                   frame. Expected to be harmless (those lists are skipped).
 		//   paced > ge      something marks frames more than once each — the cap would
-		//                   deliver target/N. Should be impossible now; if it appears,
-		//                   something other than a present is marking frames.
+		//                   deliver target/N. Should be impossible now.
 		//   paced ~= 0, fail ~= ge   every sleep refused AND no thread presents to fall
 		//                   back on: that game cannot be paced by sleeping at all.
 		//   paced ~= 0, fail = 0     already under the cap; nothing to do.
-		//   fail ~= ge      normal and healthy for Tron: its GE sleeps always refuse and
-		//                   the present site does the work. err= names the reason.
+		//   fail ~= ge      normal and healthy for a game whose GE sleeps always refuse
+		//                   and the present site does the work. err= names the reason.
 		if (DBG_UART() && g_frame_limit > 0 && !g_vskip_active) {   // silent during Intro Video Skip — limiter is fully off
 			u32 tnow = sceKernelGetSystemTimeLow();
 			if (tnow - g_fl_log_last_us >= 1000000) {
@@ -1171,17 +1097,11 @@ static void fps_maybe_tick_from_vblank(void)
 
 // Tier 3, the universal fallback: sceGeListEnQueue/EnQueueHead (see the block
 // comment above install_fps_overlay_hook) is the one kernel primitive EVERY
-// rendering technique must call to get anything drawn at all, regardless of
-// buffering scheme — confirmed on real hardware that some games (GTA, in
-// heavy-geometry view directions) stop calling BOTH SetFrameBuf and
-// WaitVblankStart/StartCB entirely while still rendering normally, so tiers 1
-// and 2 alone go completely silent for them. Only ticks once BOTH higher
-// tiers have gone quiet (a game can legitimately submit several GE lists per
-// visual frame, so this must never fire alongside a working tier 1/2 or it
-// over-counts) — 200ms since the last SetFrameBuf activity, same threshold
-// tier 2 uses, and 50ms since the last accepted vblank-tier tick (vblank
-// itself is a fixed ~16.6ms cadence, so 50ms is several missed vblanks, a
-// clear sign that tier is not the one covering this game right now).
+// rendering technique must call to get anything drawn at all. Only ticks once
+// BOTH higher tiers have gone quiet (a game can legitimately submit several GE
+// lists per visual frame, so this must never fire alongside a working tier 1/2
+// or it over-counts) — 200ms since the last SetFrameBuf activity, same
+// threshold tier 2 uses, and 50ms since the last accepted vblank-tier tick.
 static void fps_maybe_tick_from_ge(void)
 {
 	if ((g_show_fps_overlay || g_show_ft_chart) && !g_menu_open) {
@@ -1190,6 +1110,18 @@ static void fps_maybe_tick_from_ge(void)
 		    (g_fps_recent_vblank_time == 0 || now - g_fps_recent_vblank_time >= 50000))
 			fps_tick(now);
 	}
+}
+
+// The REAL sceDisplayWaitVblankStart, for callers that need the display cadence
+// without re-entering our own syscall patch (that would double-tick the FPS
+// counter). Returns at the START of vblank. Used by the gamma worker to lock
+// its pass to the display in games that never present. The delay fallback is
+// only for the case where the NID never resolved.
+int fps_wait_vblank_real(void)
+{
+	if (g_real_wait_vblank_start) return g_real_wait_vblank_start();
+	sceKernelDelayThread(16000);
+	return 0;
 }
 
 static int fps_wait_vblank_start_patched(void)
@@ -1207,21 +1139,35 @@ static int fps_wait_vblank_start_cb_patched(void)
 static int fps_ge_list_enqueue_patched(const void *list, void *stall, int cbid, void *arg)
 {
 	// per-game frame cap — paces frame PRODUCTION here. The g_frame_limit test is inline
-	// so OFF costs one load+branch and no call at all: this fires on EVERY GE submit, and
-	// a GE-heavy phase can hit thousands per second (v652 logged ge=4658 in one second).
+	// so OFF costs one load+branch and no call at all: this fires on EVERY GE submit.
 	if (g_frame_limit > 0 && !g_vskip_active) frame_limit_ge();
 	fps_maybe_tick_from_ge();
-	return g_real_ge_list_enqueue ? g_real_ge_list_enqueue(list, stall, cbid, arg) : 0;
+	// "game drew something" signal for the screen-tuning double-apply guard
+	// (screen_tuning.c). Only GAME submits land here — our own list calls the
+	// real function directly, bypassing this patch. Non-atomic ++ is fine: only
+	// changed-vs-unchanged is read, a lost increment still reads as changed.
+	g_st_ge_seq++;
+	st_ge_on_submit(list);    // decide BEFORE the real enqueue (see screen_tuning.h)
+	{
+		int r = g_real_ge_list_enqueue ? g_real_ge_list_enqueue(list, stall, cbid, arg) : 0;
+		st_ge_after_submit();   // ...and queue our correction BEHIND the game's list
+		return r;
+	}
 }
 
 static int fps_ge_list_enqueue_head_patched(const void *list, void *stall, int cbid, void *arg)
 {
 	// per-game frame cap — paces frame PRODUCTION here. The g_frame_limit test is inline
-	// so OFF costs one load+branch and no call at all: this fires on EVERY GE submit, and
-	// a GE-heavy phase can hit thousands per second (v652 logged ge=4658 in one second).
+	// so OFF costs one load+branch and no call at all: this fires on EVERY GE submit.
 	if (g_frame_limit > 0 && !g_vskip_active) frame_limit_ge();
 	fps_maybe_tick_from_ge();
-	return g_real_ge_list_enqueue_head ? g_real_ge_list_enqueue_head(list, stall, cbid, arg) : 0;
+	g_st_ge_seq++;   // same signal as the tail-enqueue hook above
+	st_ge_on_submit(list);    // decide BEFORE the real enqueue (see screen_tuning.h)
+	{
+		int r = g_real_ge_list_enqueue_head ? g_real_ge_list_enqueue_head(list, stall, cbid, arg) : 0;
+		st_ge_after_submit();   // ...and queue our correction BEHIND the game's list
+		return r;
+	}
 }
 
 // Lazily creates+starts fps_poll_thread the FIRST time it's needed - either at
@@ -1230,34 +1176,26 @@ static int fps_ge_list_enqueue_head_patched(const void *list, void *stall, int c
 // Battery Status on mid-session. If the user turns BOTH back off, the thread
 // notices at its own next loop iteration and exits itself (see fps_poll_thread),
 // clearing g_fps_poll_started so THIS function spins up a fresh thread again
-// next time. Shared with ram_usage_kb's Dynamic figure below (Settings footer)
-// - keep in sync with the sceKernelCreateThread call this feeds, though "in
-// sync" is now enforced by both sides reading this same constant instead of
-// two magic numbers.
+// next time.
 void fps_poll_ensure_started(void)
 {
 	if (g_fps_poll_started) return;
 	g_fps_poll_started = 1;
-	// Priority 32 matches a comparable reference plugin's own poll thread
-	// exactly (confirmed via disassembly of its sceKernelCreateThread call) —
-	// not the menu thread's priority 16, which runs far more eagerly than the
-	// game's own threads typically do and caused a flicker bug when tried here.
-	// (A CPU-load-correlated stall this thread appeared to have at this
-	// priority turned out to be a tick-detection gap, not starvation — see the
-	// 3-tier tick cascade above install_fps_overlay_hook — so this stays at
-	// the reference plugin's own value rather than the more aggressive
-	// priorities tried while that was still misdiagnosed.) Stack is 2048: even with the Battery ALL tier's extra lines,
-	// every draw is still a SEQUENCE of shallow sprintf/dbg_text/dbg_print/
-	// dbg_putchar calls (each one's frame freed before the next starts), never
-	// a deeper call chain than the plain FPS-only case — so peak stack depth
-	// doesn't grow with how many lines get drawn, only wall-clock cost does.
-	// Keeps real headroom for the real kernel calls in this thread
-	// (sceDisplayGetFrameBuf, WaitVblankStart, GetFramePerSec, the battery
-	// queries) whose own internal stack usage isn't ours to verify.
+	// Priority 32, not the menu thread's priority 16 (which runs more eagerly than
+	// the game's own threads typically do). Stack is 2048: every draw is a SEQUENCE
+	// of shallow sprintf/dbg_text/dbg_print/dbg_putchar calls, each one's frame
+	// freed before the next starts, so peak stack depth doesn't grow with how many
+	// lines get drawn — only wall-clock cost does. Keeps headroom for the real
+	// kernel calls in this thread (sceDisplayGetFrameBuf, WaitVblankStart,
+	// GetFramePerSec, the battery queries).
 	{
 		SceUID thid = sceKernelCreateThread("pspstates_overlay_poll", fps_poll_thread, 32, FPS_POLL_STACK_BYTES, 0, NULL);
 		if (thid >= 0) sceKernelStartThread(thid, 0, NULL);
 	}
+	// POPS: an overlay drawn into its single-buffered scanout flickers. Start the
+	// screen-tuning worker too, which keeps the overlay steady via the ping-pong
+	// shadow. Idempotent: st_ensure_started returns early if already running.
+	if (g_is_pops) st_ensure_started();
 }
 
 void install_fps_overlay_hook(void)
@@ -1302,10 +1240,9 @@ void install_fps_overlay_hook(void)
 	g_fl_last_err = 0;
 	g_fl_log_last_us = 0;
 	{
-		// Real panel period for the frame limiter — the LCD is 59.94Hz, not 60.000
-		// (see frame_limit_ge). Read ONCE here and kept as an int so the present
-		// hook never does float math on the game's thread. Same derivation
-		// fps_poll_thread already uses for its own draw budget.
+		// Real panel period for the frame limiter — the LCD is 59.94Hz, not 60.000.
+		// Read ONCE here and kept as an int so the present hook never does float math
+		// on the game's thread.
 		float hz = sceDisplayGetFramePerSec();
 		g_fl_vblank_us = (hz > 0.0f) ? (u32)(1000000.0f / hz) : 16683;
 	}
@@ -1325,10 +1262,7 @@ void install_fps_overlay_hook(void)
 	if (g_real_wait_vblank_start_cb)
 		sctrlHENPatchSyscall((void *)g_real_wait_vblank_start_cb, fps_wait_vblank_start_cb_patched);
 
-	// Tier 3 tick source (see fps_maybe_tick_from_ge's block comment) — module
-	// "sceGE_Manager" confirmed via uofw's ge.c SCE_MODULE_INFO, library
-	// "sceGe_user" confirmed via pspsdk's sceGe_user.S IMPORT_START, NIDs from
-	// psplibdoc_660.xml.
+	// Tier 3 tick source (see fps_maybe_tick_from_ge's block comment).
 	g_real_ge_list_enqueue = (int (*)(const void *, void *, int, void *))
 		sctrlHENFindFunction("sceGE_Manager", "sceGe_user", 0xAB49E76A);
 	if (g_real_ge_list_enqueue)
@@ -1341,5 +1275,18 @@ void install_fps_overlay_hook(void)
 
 	battery_resolve_syscon();
 	if (g_show_fps_overlay || g_show_battery || g_show_cpu_usage || g_show_ft_chart) fps_poll_ensure_started();
-	if (g_show_battery) battery_poll_ensure_started();
+	// Battery thread also runs for a Stop-Charging threshold alone (overlay off).
+	if (g_show_battery || g_batt_stop_charge > 0) battery_poll_ensure_started();
+	// Runs AFTER load_settings (menu.c) — the persisted settings are already live
+	// here. Logged unconditionally (not DBG_UART-routed): "did the screen-tuning
+	// pass run at all" is the first question after any in-game hang, and with the
+	// Debug setting off the log otherwise contains nothing but the boot banner.
+	{
+		char b[64];
+		sprintf(b, "[ST] settings gam=%d tmp=%d", g_st_gamma, g_st_temp);
+		uart_puts(b);
+	}
+	st_install_dialog_hooks();   // unconditional — see the declaration in screen_tuning.h
+	// A saved temperature-only config must start the worker just as a gamma one does.
+	if (st_active()) st_ensure_started();
 }

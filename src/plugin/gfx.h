@@ -3,11 +3,6 @@
 
 #include "pspfatsave.h"
 
-// Extra pixels added past the row grid at the progress-band bottom (used by
-// dbg_fill_band_color; the prog panel in fatsave.c sizes to match).
-#define PANEL_EXTRA_PX 10
-
-// Auto-generated public interface for gfx.c (review/trim).
 u16 c4444_to565(u16 c);
 u16 c5551_to565(u16 c);
 extern u32    dbg_bg;       // background color
@@ -18,8 +13,8 @@ extern u32    dbg_fg;       // foreground color (0xAABBGGRR)
 extern int    dbg_transparent;
 extern int dbg_buf_count;
 void dbg_capture_both_bufs(void);
+int  dbg_capture_buf(void **fb, int *bufw, int *pfmt);   // primary clean captured buffer (see gfx.c)
 extern void  *dbg_fb;      // KSEG1 framebuffer base;
-void dbg_fill_band_color(int row0, int nrows, u32 color);
 void dbg_fill_rect(int px, int py, int w, int h, u32 color);
 void dbg_fill_rect_all(int px, int py, int w, int h, u32 color);
 void dbg_init(void);

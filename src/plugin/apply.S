@@ -4,7 +4,7 @@
 	.text
 /* ApplyHandoff(src, dst, len, ctx) — one-way kernel apply for LOAD.
  * Never returns: copies len bytes, flushes caches, restores save-time context, jumps to save-time ra.
- * UART markers B1/B2/B3 track progress (hang diagnostic); clobber t8/t9/v0/v1 only.
+ * UART markers B1/B2/B3 track progress; clobber t8/t9/v0/v1 only.
  */
 
 // Emit one byte to UART with bounded TX-full wait. Clobbers t9/v0/v1.

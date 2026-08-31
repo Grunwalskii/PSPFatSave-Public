@@ -1,10 +1,10 @@
 // PspStates for PSP (32MB & 64MB) by Dark-Alex
 // Kernel-freeze save/load — bare-metal MS I/O, atomic RAM access
 
-// header
 #include "pspfatsave.h"
+#include "screen_tuning.h"
+#include "crash_handler.h"
 
-// info
 PSP_MODULE_INFO("pspstates_v" VERSION_STRING, PSP_MODULE_KERNEL | PSP_MODULE_SINGLE_LOAD | PSP_MODULE_SINGLE_START, 1, 1);
 
 // global — MUST be explicitly initialized (kernel PRX BSS is not zeroed!)
@@ -84,8 +84,7 @@ int OnModuleStart(SceModule2 *module)
 					if(fd > 0)
 					{
 						sceIoLseek(fd, 0x10, PSP_SEEK_SET);
-						// Only adopt the buffer if the read actually succeeded — otherwise
-						// blk points at uninitialized heap and would yield a garbage umdid.
+						// Only adopt the buffer if the read actually succeeded.
 						if(sceIoRead(fd, blk, 1) == 1)
 							sector_buffer = blk;
 						sceIoClose(fd);
@@ -176,35 +175,49 @@ int module_start(SceSize args, void *argp)
 	is_running = 0;
 	g_game_title[0] = '\0';
 	video_skip_init();
+	g_is_pops = 0;
+	st_init();   // before the menu thread exists — load_settings() there may enable it
 
 	// Version banner (raw): appears regardless of Debug setting for deploy verification.
 	WriteDebugLogRaw("=== pspstates_v" VERSION_STRING " module_start() ===");
 	WriteDebugLog("Save browser — hook-only input + on-demand menu thread");
 
-	// Gate on GAME keyconfig + disc apitype to exclude PSPLink/VSH.
+	// The PRX is loaded in every runlevel (XMB included), so this gate decides where
+	// the plugin actually runs. Accepted:
+	//   PSP game — KEYCONFIG_GAME (0x200) + disc apitype 0x120..0x12F.
+	//   PS1/POPS — KEYCONFIG_POPS (0x300) + APITYPE_MS5 (0x144).
 	{
 		int apitype = sceKernelInitApitype();
-		if(sceKernelInitKeyConfig() != PSP_INIT_KEYCONFIG_GAME ||
-		   apitype < PSP_INIT_APITYPE_DISC || apitype > 0x12F) {
-			return 1;
-		}
+		int keycfg  = sceKernelInitKeyConfig();
+		int is_game = (keycfg == PSP_INIT_KEYCONFIG_GAME &&
+		               apitype >= PSP_INIT_APITYPE_DISC && apitype <= 0x12F);
+		g_is_pops = (keycfg == PSP_INIT_KEYCONFIG_POPS &&
+		             apitype == PSP_INIT_APITYPE_MS5);
+		if (!is_game && !g_is_pops) return 1;
 	}
 
 	// UART debug channel (in-game only); boot banner for deploy verification.
 	uart_init();
-	uart_puts("=== pspstates_v" VERSION_STRING " boot ===");
+	uart_puts(g_is_pops ? "=== pspstates_v" VERSION_STRING " boot (POPS/PS1) ==="
+	                  : "=== pspstates_v" VERSION_STRING " boot ===");
+	// Catches genuine CPU faults (bad access, bus error, reserved instr, etc.)
+	// and dumps EPC/Cause/BadVAddr/GPRs + faulting module over UART before a
+	// clean soft reset. Installed right after uart_init() so it can log
+	// immediately if it ever fires. Does NOT catch a pure hardware bus stall
+	// with no CPU exception - see crash_handler.h.
+	crash_handler_install();
 
 	// Intercept controller reads via SYSCALL table patching (firmware-independent).
 	g_real_ctrl_peek = (int(*)(SceCtrlData*,int))sctrlHENFindFunction("sceController_Service", "sceCtrl", 0x3A622550);
 	g_real_ctrl_read = (int(*)(SceCtrlData*,int))sctrlHENFindFunction("sceController_Service", "sceCtrl", 0x1F803938);
 	if (g_real_ctrl_peek) sctrlHENPatchSyscall((void *)g_real_ctrl_peek, sceCtrlPeekBufferPositivePatched);
 	if (g_real_ctrl_read) sctrlHENPatchSyscall((void *)g_real_ctrl_read, sceCtrlReadBufferPositivePatched);
-	// Hook NEGATIVE-format reads (third button leak workaround).
+	// Hook NEGATIVE-format reads.
 	g_real_ctrl_peek_neg = (int(*)(SceCtrlData*,int))sctrlHENFindFunction("sceController_Service", "sceCtrl", 0xC152080A);
 	g_real_ctrl_read_neg = (int(*)(SceCtrlData*,int))sctrlHENFindFunction("sceController_Service", "sceCtrl", 0x60B81F86);
 	if (g_real_ctrl_peek_neg) sctrlHENPatchSyscall((void *)g_real_ctrl_peek_neg, sceCtrlPeekBufferNegativePatched);
 	if (g_real_ctrl_read_neg) sctrlHENPatchSyscall((void *)g_real_ctrl_read_neg, sceCtrlReadBufferNegativePatched);
-	// Hook LATCH reads (second button leak workaround).
+	// Hook LATCH reads.
 	g_real_ctrl_readlatch = (int(*)(SceCtrlLatch*))sctrlHENFindFunction("sceController_Service", "sceCtrl", 0x0B588501);
 	g_real_ctrl_peeklatch = (int(*)(SceCtrlLatch*))sctrlHENFindFunction("sceController_Service", "sceCtrl", 0xB1D0E5CD);
 	if (g_real_ctrl_readlatch) sctrlHENPatchSyscall((void *)g_real_ctrl_readlatch, sceCtrlReadLatchPatched);
@@ -244,6 +257,9 @@ int module_start(SceSize args, void *argp)
 // module_stop
 int module_stop(SceSize args, void *argp)
 {
+	// Undo the POPS flip-hook patch (written into firmware code); st_stop() also
+	// calls this on game exit, and it no-ops if nothing is installed.
+	st_pops_remove_flip();
 	is_running = 1;
 	return 0;
 }

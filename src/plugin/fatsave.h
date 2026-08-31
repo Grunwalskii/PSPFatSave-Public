@@ -10,7 +10,6 @@
 // Shared compression / MS-staging work buffer (menu.c decodes thumbnails into it).
 extern u8 work_buf[COMPRESS_BUF_SIZE];
 
-// Auto-generated public interface for fatsave.c (review/trim).
 void arm_input_suppress(void);
 int cooperative_volmem_release(const SceUID *game_tids, int tcount);
 void copy_game_thumb(const char *bin_path);

@@ -6,15 +6,14 @@
 #include "videoskip.h"
 #include "menu.h"
 #include "fatsave.h"
+#include "screen_tuning.h"
+#include "cheats.h"
 
 // Set when the menu is opened by the boot auto-open (vs a NOTE tap): the browser then starts
 // on the newest save (for a quick load) regardless of the Default Slot setting. One-shot.
 static int g_autoopen_launch = 0;
 // Set by the pad hook (GAME thread) to ask the MENU thread to evaluate boot auto-open. The
-// hook must NOT touch the Memory Stick (a game-thread sceIo* at boot contends with the game's
-// own startup streaming, so a game thread ends up mid-msstor-read when the menu suspends it ->
-// the frozen enumerate deadlocks on the FATMS lock, MS LED flashing). The menu thread does the
-// MS check on its own (safe) thread.
+// menu thread does the MS check on its own (safe) thread.
 static int g_autoopen_pending = 0;
 // run_save_browser() sets this to 1 the moment the freeze succeeds and it actually opens; it
 // stays 0 if the freeze aborted (game too busy). Lets the boot auto-open retry until it opens.
@@ -33,8 +32,8 @@ static int game_autoopen_enabled(void)
 	return en;
 }
 
-// Load the RUNNING game's Frame Limit from its per-game settings file into
-// Load g_frame_limit from game config (must be called from MENU thread, not game thread).
+// Load the RUNNING game's Frame Limit from its per-game settings file into g_frame_limit
+// (must be called from MENU thread, not game thread).
 void game_frame_limit_load(void)
 {
 	char p[96]; SceUID fd; u32 buf[4]; int n;
@@ -81,11 +80,9 @@ void PspLsLibraryLauncher(SceCtrlData *pad_data)
 
 	if (g_menu_open) { note_was_down = note_down; return; }  // browser up — track edge only
 
-	// Boot auto-open (once): on the first controller read (display + game threads are up,
-	// umdid known) just SIGNAL the menu thread. Do NOT read the MS here — a game-thread
-	// sceIo* at boot contends with the game's startup streaming and reintroduces the
-	// frozen-enumerate FATMS deadlock (MS LED flashing). The menu thread does the per-game
-	// check + opens on its own (safe) thread, and retries as the game settles.
+	// Boot auto-open (once): on the first controller read just SIGNAL the menu thread; do
+	// not read the MS here. The menu thread does the per-game check + opens on its own
+	// (safe) thread, and retries as the game settles.
 	if (g_autoload_armed) {
 		g_autoload_armed = 0;
 		g_autoopen_pending = 1;
@@ -117,6 +114,103 @@ void PspLsLibraryLauncher(SceCtrlData *pad_data)
 // game's pad never shows it. To detect the NOTE tap we do our OWN kernel-mode
 // peek (k1=0 -> unmasked, includes NOTE) into a scratch pad and run detection on
 // that. The game's own pad is returned untouched (mute-on-hold still reaches it).
+// ── Live gamma HUD input ──
+// Runs off the SAME kernel-mode peek the NOTE tap uses, so it sees the real pad
+// regardless of what we blank from the game (st_hud_mask). Edge-triggered:
+// one step per press, which is plenty for a 10-step range and avoids any
+// auto-repeat timing on the game's thread.
+// g_hud_prev starts all-1s so the very first sample can never register a press
+// (a stale edge here would close the HUD the instant it opened).
+static u32 g_hud_prev = 0xFFFFFFFFu;
+
+static int fl_repeat_fire(int hold);   // forward — defined below run_st_test
+
+void st_hud_open(void)
+{
+	g_hud_prev = 0xFFFFFFFFu;
+	g_st_hud = 1;
+}
+
+// Hold-to-repeat state for the live HUD (level-driven, like Frame Limit).
+static int gh_hold_l, gh_hold_r, gh_hold_u, gh_hold_d;
+
+static void st_hud_input(u32 buttons)
+{
+	// Level-driven auto-repeat for all four directions.
+	// L: colour temp down
+	if (buttons & PSP_CTRL_LEFT) {
+		gh_hold_l++; gh_hold_r = 0;
+		if (fl_repeat_fire(gh_hold_l) && g_st_temp > 0) {
+			g_st_temp--; g_st_hud_dirty = 1;
+		}
+	} else {
+		if (gh_hold_l >= 1 && gh_hold_l < 5 && g_st_temp > 0) {
+			g_st_temp--; g_st_hud_dirty = 1;
+		}
+		gh_hold_l = 0;
+	}
+	// R: colour temp up
+	if (buttons & PSP_CTRL_RIGHT) {
+		gh_hold_r++; gh_hold_l = 0;
+		if (fl_repeat_fire(gh_hold_r) && g_st_temp < 200) {
+			g_st_temp++; g_st_hud_dirty = 1;
+		}
+	} else {
+		if (gh_hold_r >= 1 && gh_hold_r < 5 && g_st_temp < 200) {
+			g_st_temp++; g_st_hud_dirty = 1;
+		}
+		gh_hold_r = 0;
+	}
+	// UP: gamma up (brighter, 1.01..2.00)
+	if (buttons & PSP_CTRL_UP) {
+		gh_hold_u++; gh_hold_d = 0;
+		if (fl_repeat_fire(gh_hold_u) && g_st_gamma < 200) {
+			g_st_gamma++; g_st_hud_dirty = 1;
+		}
+	} else {
+		if (gh_hold_u >= 1 && gh_hold_u < 5 && g_st_gamma < 200) {
+			g_st_gamma++; g_st_hud_dirty = 1;
+		}
+		gh_hold_u = 0;
+	}
+	// DOWN: gamma down (darker, 0.50..0.99)
+	if (buttons & PSP_CTRL_DOWN) {
+		gh_hold_d++; gh_hold_u = 0;
+		if (fl_repeat_fire(gh_hold_d) && g_st_gamma > 50) {
+			g_st_gamma--; g_st_hud_dirty = 1;
+		}
+	} else {
+		if (gh_hold_d >= 1 && gh_hold_d < 5 && g_st_gamma > 50) {
+			g_st_gamma--; g_st_hud_dirty = 1;
+		}
+		gh_hold_d = 0;
+	}
+
+	// Close on new press of X/O (edge-driven — don't want hold to close).
+	{
+		u32 pressed = buttons & ~g_hud_prev;
+		g_hud_prev = buttons;
+		if (pressed & (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE)) g_st_hud = 0;
+	}
+	// If the user just turned gamma/temp back on from neutral, restart the
+	// worker — it exits when st_active() goes false (gamma=1.0, temp=100).
+	if (st_active()) st_ensure_started();
+}
+
+// While the HUD is up the D-Pad and X/O are OURS, not the game's — otherwise
+// tuning gamma also steers the car. Blank them from every buffer read the game makes.
+#define ST_HUD_MASK (PSP_CTRL_LEFT | PSP_CTRL_RIGHT | PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS | PSP_CTRL_CIRCLE)
+static void st_hud_mask(SceCtrlData *pad_data, int count, int res, int negative)
+{
+	int i, n;
+	if (!g_st_hud || !pad_data || res <= 0) return;
+	n = (res < count) ? res : count;
+	for (i = 0; i < n; i++) {
+		if (negative) pad_data[i].Buttons |=  ST_HUD_MASK;   // negative logic: 1 = not pressed
+		else          pad_data[i].Buttons &= ~ST_HUD_MASK;
+	}
+}
+
 static void detect_note_tap(void)
 {
 	SceCtrlData kpad;
@@ -124,8 +218,13 @@ static void detect_note_tap(void)
 	// with kernel-stack pointers from the GAME's syscall context. kpeek's own
 	// k1 save/restore nests harmlessly inside this bracket.
 	int k1 = pspSdkSetK1(0);
-	if (kpeek(&kpad) > 0)
+	if (kpeek(&kpad) > 0) {
+		// !g_menu_open: the browser/settings screens drive themselves off this same
+		// kernel pad, so without this the D-Pad would move a menu row AND retune
+		// gamma at once.
+		if (g_st_hud && !g_menu_open) st_hud_input(kpad.Buttons);
 		PspLsLibraryLauncher(&kpad);
+	}
 	pspSdkSetK1(k1);
 }
 
@@ -133,43 +232,17 @@ int sceCtrlPeekBufferPositivePatched(SceCtrlData *pad_data, int count)
 {
 	int res = g_real_ctrl_peek ? g_real_ctrl_peek(pad_data, count)
 	                           : sceCtrlPeekBufferPositive(pad_data, count);
+	st_hud_mask(pad_data, count, res, 0);          // BEFORE vskip, or it would wipe the injected press
 	vskip_inject_buttons(pad_data, count, res, 0);
 	detect_note_tap();
 	return res;
 }
 
-// THIRD button leak fix (buffer-backlog games, e.g. Tomb Raider Legends), grounded
-// in PSP_References/uofw-master/src/kd/ctrl/ctrl.c's _sceCtrlReadBuf: mode is a
-// 2-bit field (bit1 = Read(2/3) vs Peek(0/1), bit0 = Negative(1/3) vs Positive(0/2)).
-// ONLY a "Read" call (mode & READ_BUFFER_POSITIVE, true for BOTH mode 2 and mode 3 —
-// Positive and Negative alike) advances a persistent per-caller-mode "unread" ring
-// cursor (firstUnReadUpdatedBufIndex) into a 64-slot hardware-sampled ring
-// (CTRL_NUM_INTERNAL_CONTROLLER_BUFFERS); a "Peek" call never does — it always
-// returns just the latest sample. That ring is filled by a kernel timer/interrupt
-// which suspend_escalating() does NOT freeze (only the game's own user threads are
-// suspended; kernel threads/dispatcher/interrupts stay on), so real hardware button
-// presses made WHILE the menu is open (X to save, O to close) keep landing in the
-// game's own user-mode ring the whole time, utterly unrelated to what our
-// kernel-mode wait_buttons_up()/kpeek() polls (that touches g_ctrl.kernelModeData,
-// a SEPARATE buffer from the game's g_ctrl.userModeData — selected by
-// pspK1IsUserMode() at call time). A Read-based game's first several post-resume
-// Read calls drain that backlog ONE ENTRY AT A TIME (not all at once), replaying
-// the menu's own presses as delayed "live" input — this is what neither
-// wait_buttons_up() (drains only the CURRENT peek state) nor g_suppress_latch
-// (drains a same-instant OR-accumulator, unrelated buffer) ever covered.
-// Fix: blank (force-zero Positive / force-all-1s Negative — see the mode&PEEK_BUFFER_
-// NEGATIVE bit-inversion in _sceCtrlReadBuf) only the ring slots that were SAMPLED DURING
-// THE MENU, identified by their timestamp. Every controller sample carries the
-// sceKernelGetSystemTimeLow() it was captured at (uofw ctrl.c:1649/2136); g_suppress_posbuf_ts
-// is that clock captured at resume (arm time). A slot stamped at/before the arm is stale menu
-// input -> blank it; the FIRST slot stamped AFTER the arm is genuine post-resume input, so it
-// (and everything after) passes through and suppression ENDS immediately.
-//
-// This replaces a flat "blank the next N slots" count, which also ate REAL presses: a game
-// that drains the ring slowly (GTA reads few slots/sec) stretched 80 blanked slots into ~5s
-// of dead X after every menu close/save. The timestamp gate blanks exactly the menu backlog
-// and not one fresh press. g_suppress_posbuf_calls stays as an UPPER BOUND only (safety, in
-// case a game never presents a fresh-stamped slot). Armed via arm_input_suppress().
+// Blank controller ring slots sampled during the menu (identified by their timestamp,
+// at/before the resume arm) so a Read-based game doesn't replay the menu's presses as
+// delayed "live" input. The first slot stamped after the arm passes through and suppression
+// ends. g_suppress_posbuf_calls stays as an UPPER BOUND only (safety, in case a game never
+// presents a fresh-stamped slot). Armed via arm_input_suppress().
 void suppress_posbuf_slots(SceCtrlData *pad_data, int count, int res, u32 clean_value)
 {
 	int i, n;
@@ -193,50 +266,40 @@ int sceCtrlReadBufferPositivePatched(SceCtrlData *pad_data, int count)
 	int res = g_real_ctrl_read ? g_real_ctrl_read(pad_data, count)
 	                           : sceCtrlReadBufferPositive(pad_data, count);
 	suppress_posbuf_slots(pad_data, count, res, 0);   // positive logic: 0 = nothing pressed
+	st_hud_mask(pad_data, count, res, 0);
 	vskip_inject_buttons(pad_data, count, res, 0);    // AFTER the suppress, or it would wipe the injected press
 	detect_note_tap();
 	return res;
 }
 
-// Peek never carries backlog (see the block comment above) — pure passthrough,
-// kept only so NOTE-tap detection still fires for a game that reads this way.
+// Peek never carries backlog — pure passthrough, kept only so NOTE-tap detection
+// still fires for a game that reads this way.
 int sceCtrlPeekBufferNegativePatched(SceCtrlData *pad_data, int count)
 {
 	int res = g_real_ctrl_peek_neg ? g_real_ctrl_peek_neg(pad_data, count)
 	                               : sceCtrlPeekBufferNegative(pad_data, count);
+	st_hud_mask(pad_data, count, res, 1);
 	vskip_inject_buttons(pad_data, count, res, 1);
 	detect_note_tap();
 	return res;
 }
 
-// Same backlog-cursor issue as ReadBufferPositive (see the block comment above —
-// the mode bit that gates it doesn't distinguish Positive from Negative), so it
-// needs the identical drain, just with the negative-logic "clean" value (all 1s).
+// Same drain as ReadBufferPositive, with the negative-logic "clean" value (all 1s).
 int sceCtrlReadBufferNegativePatched(SceCtrlData *pad_data, int count)
 {
 	int res = g_real_ctrl_read_neg ? g_real_ctrl_read_neg(pad_data, count)
 	                               : sceCtrlReadBufferNegative(pad_data, count);
 	suppress_posbuf_slots(pad_data, count, res, 0xFFFFFFFFu);   // negative logic: all-1s = nothing pressed
+	st_hud_mask(pad_data, count, res, 1);
 	vskip_inject_buttons(pad_data, count, res, 1);              // AFTER the suppress, or it would wipe the injected press
 	detect_note_tap();
 	return res;
 }
 
-// SECOND button leak fix (latch-reading games, e.g. Ratchet & Clank). The game
-// calls these via syscall, so the real sceCtrlReadLatch below runs in the GAME's
-// USER-mode k1 and drains g_ctrl.userModeData — the latch the game actually reads
-// (our kernel-mode drain in wait_buttons_up hit the KERNEL latch; uofw ctrl.c
-// selects user/kernel by pspK1IsUserMode). While g_suppress_latch is set (armed by
-// arm_input_suppress() at every menu->game resume point), zero the returned edges
-// so the game never sees the menu's stale "X make". Read drains normally (that's
-// what Read does); Peek is made to drain too INSIDE the window so a peek-only game
-// doesn't keep seeing the stale edge after the window clears. SELF-CLEARING: unlike
-// the buffer backlog above (which drains gradually, one ring slot per game call),
-// the latch accumulator is a same-instant OR of make/break/press/release bits with
-// no depth — ONE drained read (ours or the game's) empties it completely, so the
-// very first hit while armed clears g_suppress_latch back to 0 itself. This lets
-// every arm_input_suppress() call site skip a matching "clear" step (harmless if a
-// game never calls these at all — the flag just sits at 1, inert, forever).
+// While g_suppress_latch is set (armed by arm_input_suppress()), zero the returned
+// latch edges so the game never sees the menu's stale presses. SELF-CLEARING: a
+// single drained read empties the latch accumulator, so the first hit while armed
+// clears g_suppress_latch back to 0 itself.
 int sceCtrlReadLatchPatched(SceCtrlLatch *latch)
 {
 	int res = g_real_ctrl_readlatch ? g_real_ctrl_readlatch(latch)
@@ -620,30 +683,24 @@ static int confirm_version_load(u32 save_ver, u32 plug_ver, int by)
 	wait_release(PSP_CTRL_TRIANGLE | PSP_CTRL_CIRCLE);
 	return (hit & PSP_CTRL_TRIANGLE) ? 1 : 0;
 }
-// Forward decl: save_settings() is defined further below (global settings
-// persistence), after this function — needed here so declining a non-stock
-// step can write the reset back to settings.cfg immediately.
-static void save_settings(void);
+// save_settings() is defined further below (global settings persistence), after
+// this function — declared in menu.h (non-static: the gamma worker calls it too),
+// so declining a non-stock step can write the reset back to settings.cfg here.
 
 // Boot-time frozen prompt sequence, run on the menu thread at first wake. Freezes the game
 // ONCE (same FAST dispatch-off gate as run_save_browser, no MS-lock probe) and, while frozen,
 // shows any of: the overclock-confirm prompt, then the CAPTURE arm gate — then resumes ONCE.
-// A single continuous freeze is deliberate: the game never advances a frame between the two
-// prompts, so the intro stays exactly where it was until the user arms the skip.
-//   do_oc  : a non-stock overclock step is persisted -> ask X/O before applying it (so a step
-//            that hung last session can be declined without editing settings.cfg by hand).
-//            Declining resets g_overclock_id to 0 and persists it (won't ask again next boot).
+// A single continuous freeze keeps the game from advancing a frame between the two prompts.
+//   do_oc  : a non-stock overclock step is persisted -> ask X/O before applying it.
+//            Declining resets g_overclock_id to 0 and persists it.
 //   do_arm : Video Skip = CAPTURE -> show "Hold RIGHT until Intro skipped" and wait for the
 //            user to hold D-pad Right for 1s. The game then resumes with Right ALREADY held,
-//            so the capture (started right after) fires from the intro's first frame under
-//            the user's control. This replaces the old forced-5s window, which on a psmf-patch
-//            game (Pirates) skipped the intro before the banner was even readable.
+//            so the capture fires from the intro's first frame under the user's control.
 //
 // MUST freeze first: the game keeps rendering its own frames, which instantly overwrites
 // anything drawn straight to the framebuffer. pin_current_display() reasserts the live buffer
-// to the display controller so the draw doesn't land off-screen (the FreezeSave/FreezeLoad
-// Pirates/Tomb Raider "invisible banner" bug); dbg_init() then grabs that consistent buffer.
-// Defined further below (with the save browser) — same MS-FAT-lock hazard applies here.
+// to the display controller so the draw doesn't land off-screen; dbg_init() then grabs that
+// consistent buffer.
 int  ms_probe_after_freeze(void);
 void ms_probe_reap(void);
 
@@ -653,12 +710,8 @@ void boot_frozen_prompts(int do_oc, int do_arm)
 
 	if (!do_oc && !do_arm) return;
 
-	// Same freeze + MS-lock probe the save browser uses. At BOOT the game is streaming its
-	// ISO from the Memory Stick, so a bare freeze can catch a game thread INSIDE the FAT
-	// driver holding its lock: the MS LED then blinks the whole time we're frozen, and any
-	// MS I/O we do (the O/decline path's save_settings) blocks on that lock forever. The
-	// probe (async open — the IO thread blocks on the lock, not us) confirms the lock is
-	// FREE before we proceed; if a frozen thread holds it, resume so it finishes and retry.
+	// Same freeze + MS-lock probe the save browser uses: the probe confirms the MS lock is
+	// free before we proceed; if a frozen thread holds it, resume so it finishes and retry.
 	for (attempt = 0; attempt < 8 && !frozen; attempt++) {
 		if (attempt) sceKernelDelayThread(20000);
 		if (suspend_escalating(0, 500) != 0) { resume_game_threads(); continue; }  // a thread wouldn't freeze
@@ -745,53 +798,83 @@ void boot_frozen_prompts(int do_oc, int do_arm)
 
 // ── Global settings persistence (SAVESTATE/settings.cfg: magic + ints) ──
 // [0]=magic, [1]=debug routing, [2]=default slot, [3]=overclock step,
-// [4]=UART logging, [5]=FPS overlay mode (0/1/2/3s), [6]=FPS 1% Low toggle,
-// [7]=Battery overlay mode (0=Off 1=Percent 2=Percent+Time 3=ALL),
-// [8]=CPU & GPU Usage toggle (0=Off 1=On), [9]=Frametime Chart toggle (0/1).
+// [4]=UART logging, [5]=Show-FPS mode (0=Off 1=FPS 2=+1% 3=+Frametime),
+// [6]=FPS update rate (1..10 = 0.1..1.0s), [7]=Battery overlay mode (0=Off
+// 1=Percent 2=Percent+Time 3=ALL), [8]=CPU & GPU Usage toggle (0=Off 1=On),
+// [9]=overlay location (0=Up Left 1=Up Right 2=Down Left 3=Down Right; older
+// files wrote 0 here, so no generation bump was needed), [10]=Overclock stable
+// flag, [11]=real battery capacity mAh (0 = stock/BMS), [12]=free slot,
+// [13]=Stop-Charging threshold % (0=OFF, else 80..95).
+//
+// The magic IS the settings generation; a file whose magic/size doesn't match the current
+// build is rejected wholesale (defaults load, and the file is rewritten with the current
+// magic + defaults) so the reset happens exactly once.
 // Per-game settings (Auto-Open, Intro Video Skip, Frame Limit, Save Compression)
-// stored in gameset.cfg. Older settings.cfg files load correctly (size-tolerant).
+// stored in gameset.cfg; gamma in screen.cfg.
 #define SETTINGS_PATH  "ms0:/seplugins/SAVESTATE/settings.cfg"
-#define SETTINGS_MAGIC 0x53455441u   // "SETA"
+#define SETTINGS_MAGIC 0x53455443u   // "SETC" — settings generation; bump the letter on any layout change
 
 void load_settings(void)
 {
-	SceUID fd; u32 buf[11]; int n;
+	SceUID fd; u32 buf[14]; int n;
 	fd = sceIoOpen(SETTINGS_PATH, PSP_O_RDONLY, 0);
-	if (fd < 0) return;                          // no file -> keep defaults
+	if (fd < 0) return;                          // no file -> keep defaults, nothing to adopt
 	n = sceIoRead(fd, buf, sizeof(buf));
-	if (n >= (int)(5 * sizeof(u32)) && buf[0] == SETTINGS_MAGIC) {
+	sceIoClose(fd);                              // close BEFORE any rewrite (load may re-save)
+	// Strict: right magic AND full 14 words, else the file is another
+	// generation (see the generation scheme above) or corrupt — defaults load.
+	if (n == (int)sizeof(buf) && buf[0] == SETTINGS_MAGIC) {
 		g_show_debug   = (int)buf[1];            // debug routing 0..3 (see g_show_debug)
 		if (g_show_debug < 0 || g_show_debug > 3) g_show_debug = 0;
 		g_default_slot = buf[2] ? 1 : 0;
 		g_stage_spot   = 1;                      // always Mid: the snapshot stages in the safe middle 8MB
-		// buf[3] was the unused "Apply blob spot" setting (removed; g_apply_base is now fixed
-		// at 0x89800000) — reused for the overclock step so the 5-word format stays stable.
 		g_overclock_id = (int)buf[3];
 		if (g_overclock_id < 0 || g_overclock_id >= OC_STEPS) g_overclock_id = 0;
 		g_uart_log     = buf[4] ? 1 : 0;
-		// buf[5]/buf[6]/buf[7]/buf[8]/buf[9] are NEWER — an older file won't have
-		// some or all of them; default off rather than rejecting the whole read.
-		g_show_fps_overlay = (n >= (int)(6 * sizeof(u32))) ? (int)buf[5] : 0;
+		g_show_fps_overlay = (int)buf[5];        // mode 0..3
 		if (g_show_fps_overlay < 0 || g_show_fps_overlay > 3) g_show_fps_overlay = 0;
-		g_fps_show_lows = (n >= (int)(7 * sizeof(u32))) ? (buf[6] ? 1 : 0) : 0;
-		g_show_battery  = (n >= (int)(8 * sizeof(u32))) ? (int)buf[7] : 0;
+		g_fps_rate = (int)buf[6];                // 1..10 = 0.1..1.0s
+		if (g_fps_rate < 1 || g_fps_rate > 10) g_fps_rate = 10;
+		g_show_battery  = (int)buf[7];
 		if (g_show_battery < 0 || g_show_battery > 3) g_show_battery = 0;
-		g_show_cpu_usage = (n >= (int)(9 * sizeof(u32))) ? (buf[8] ? 1 : 0) : 0;
-		g_show_ft_chart  = (n >= (int)(10 * sizeof(u32))) ? (buf[9] ? 1 : 0) : 0;
-		g_overclock_stable = (n >= (int)(11 * sizeof(u32))) ? (buf[10] ? 1 : 0) : 0;
+		g_show_cpu_usage = buf[8] ? 1 : 0;
+		g_overlay_pos = (int)buf[9];            // overlay anchor corner 0..3
+		if (g_overlay_pos < 0 || g_overlay_pos > 3) g_overlay_pos = 0;
+		// [12] free slot this generation; 1%/Frametime derive from the mode.
+		g_fps_show_lows = (g_show_fps_overlay >= 2) ? 1 : 0;
+		g_show_ft_chart = (g_show_fps_overlay >= 3) ? 1 : 0;
+		g_overclock_stable = buf[10] ? 1 : 0;
+		g_batt_real_mah = (int)buf[11];
+		if (g_batt_real_mah < 0 || g_batt_real_mah > 20000) g_batt_real_mah = 0;
+		g_welcome_shown = buf[12] ? 1 : 0;   // one-time Welcome screen seen flag
+		g_batt_stop_charge = (int)buf[13];   // Stop-Charging threshold % (0=OFF, 100=ON/never, else 70..95)
+		if (g_batt_stop_charge != 0 && g_batt_stop_charge != 100 &&
+		    (g_batt_stop_charge < 70 || g_batt_stop_charge > 95))
+			g_batt_stop_charge = 0;
+	} else if (n > 0) {
+		// Old generation or corrupt: NO migration — keep defaults and rewrite the
+		// file with this build's magic so the reset is visible once, not every boot.
+		// (menu-thread context, game just booted: sceIo alive, MS safe to write.)
+		WriteDebugLog("[SET] settings.cfg wrong generation - defaults loaded, file rewritten");
+		save_settings();
 	}
-	sceIoClose(fd);
 }
 
-static void save_settings(void)
+// Persists the global settings.cfg (menu thread, Memory-Stick safe). Called from
+// the settings menu on close. Gamma and colour temperature are PER-GAME and saved
+// separately through st_save_game_gamma() (screen.cfg) — they no longer ride here.
+void save_settings(void)
 {
-	SceUID fd; u32 buf[11];
+	SceUID fd; u32 buf[14];
 	buf[0] = SETTINGS_MAGIC; buf[1] = (u32)g_show_debug;
 	buf[2] = (u32)g_default_slot; buf[3] = (u32)g_overclock_id;
 	buf[4] = (u32)g_uart_log; buf[5] = (u32)g_show_fps_overlay;
-	buf[6] = (u32)g_fps_show_lows; buf[7] = (u32)g_show_battery;
-	buf[8] = (u32)g_show_cpu_usage; buf[9] = (u32)g_show_ft_chart;
+	buf[6] = (u32)g_fps_rate; buf[7] = (u32)g_show_battery;
+	buf[8] = (u32)g_show_cpu_usage; buf[9] = (u32)g_overlay_pos;   // overlay anchor corner (see word map)
 	buf[10] = (u32)g_overclock_stable;
+	buf[11] = (u32)g_batt_real_mah;   // real battery capacity mAh (0 = stock)
+	buf[12] = (u32)g_welcome_shown;   // one-time Welcome screen seen flag (0 -> show once)
+	buf[13] = (u32)g_batt_stop_charge;   // Stop-Charging threshold % (0=OFF, else 80..95)
 	sceIoMkdir("ms0:/seplugins/SAVESTATE", 0777);
 	fd = sceIoOpen(SETTINGS_PATH, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
 	if (fd >= 0) { sceIoWrite(fd, buf, sizeof(buf)); sceIoClose(fd); }
@@ -848,22 +931,13 @@ void save_game_settings(const char *gid)
 	if (fd >= 0) { sceIoWrite(fd, buf, sizeof(buf)); sceIoClose(fd); }
 }
 
-// Free KERNEL partition (mpid 1) RAM, in KB — the partition this kernel PRX
-// actually lives in, so it reflects the plugin's own footprint pressure.
-// sceKernelTotalFreeMemSize() is the USER partition (== sceKernelPartitionTotalFreeMemSize(2),
-// uofw partition.c) = the game's spare RAM, which is game-dependent and does NOT
-// change with the plugin's own size — the wrong number for this. Resolve the
-// kernel export at runtime (SysMemForKernel 0x0115B0F8, same lookup me_rpc_probe
-// uses); fall back to the user-partition call if it can't be resolved. Shared by
-// the Settings-footer readout (ram_usage_kb) and the low-RAM save/load guard
-// (run_save_browser) so both agree on the exact same number.
+// Free KERNEL partition (mpid 1) RAM, in KB — the partition this kernel PRX lives in.
+// Resolve the kernel export at runtime (SysMemForKernel 0x0115B0F8); fall back to the
+// user-partition call if it can't be resolved. Shared by the Settings-footer readout
+// (ram_usage_kb) and the low-RAM save/load guard (run_save_browser) so both agree on
+// the same number.
 //
-// LOW_RAM_SAVE_LOAD_KB: below this much free kernel RAM, Save/Load are refused
-// outright instead of attempted - observed (user report) that free RAM around
-// ~35KB caused a crash during save/load (the freeze + compress/decompress work
-// needs real headroom). 50KB is a safety margin above that observed failure
-// point, not a value derived from a measured hard minimum - revisit if a crash
-// is ever seen above it, or if legitimate saves ever get refused below it.
+// LOW_RAM_SAVE_LOAD_KB: below this much free kernel RAM, Save/Load are refused.
 #define LOW_RAM_SAVE_LOAD_KB 50
 static u32 free_kernel_ram_kb(void)
 {
@@ -895,16 +969,18 @@ void ram_usage_kb(u32 *static_kb, u32 *dynamic_kb, u32 *free_kb)
 			*static_kb = (mi.text_size + mi.data_size + mi.bss_size + 1023) / 1024;
 	}
 	*dynamic_kb = (MENU_STACK_BYTES + (g_fps_poll_started ? FPS_POLL_STACK_BYTES : 0)
-	               + (g_battery_poll_started ? BATTERY_POLL_STACK_BYTES : 0) + 1023) / 1024;
+	               + (g_battery_poll_started ? BATTERY_POLL_STACK_BYTES : 0)
+	               + (g_st_worker_started ? ST_WORKER_STACK_BYTES : 0) + 1023) / 1024;
 	*free_kb = free_kernel_ram_kb();
 }
 
 // Draw the settings screen. sel = highlighted row (GLOBAL section first, then the
-// per-game section): 1 Default Slot, 2 Show FPS, 3 FPS 1% Lows, 4 Frametime Chart,
-// 5 CPU Usage, 6 Battery Status, 7 Overclock (all global) | 8 Debug Messages (debug
-// builds only; merged with UART Log) | 9 Intro Video Skip, 10 Auto-Open, 11 Frame Limit
-// (all per-game, gameset.cfg). Debug Messages sits alone above the "Game specific
-// Settings" header.
+// per-game section): 1 Default Slot, 2 Show FPS (L/R mode, Tri/X update rate),
+// 3 Overlay Location, 4 CPU & GPU Usage, 5 Battery Status, 6 Stop Charging,
+// 7 Overclock (all global) | 8 Debug Messages (debug builds only; merged with
+// UART Log) | 9 Screen Tuning, 10 FPS unlocks, 11 Frame Limit, 12 Intro Video
+// Skip, 13 Auto-Open (all per-game). Debug Messages sits alone above the
+// "Game specific Settings" header.
 // One settings row: highlight band + white label/value text. Keeps the row
 // geometry (band at row*8-4, text at column 6) in exactly one place, so a row
 // can't drift out of sync with its own highlight.
@@ -921,11 +997,8 @@ static void draw_settings_row(int row, int selected, const char *line)
 }
 
 // Builds one "Label:              < value >" row. The label is left-justified
-// into a fixed-width field (%-20s) so every row's "<" starts at the same
-// column regardless of label length — previously each row hand-counted its
-// own padding spaces, and they'd drifted out of sync with each other (values
-// visibly staggered horizontally row to row) whenever a label changed length.
-// 20 chars comfortably fits the longest label here ("Auto-Open on Boot:").
+// into a fixed-width field (%-20s) so every row's "<" starts at the same column
+// regardless of label length. 20 chars fits the longest label here ("Auto-Open on Boot:").
 static void settings_line(char *line, const char *label, const char *value)
 {
 	sprintf(line, "%-20s< %s >", label, value);
@@ -934,64 +1007,76 @@ static void settings_line(char *line, const char *label, const char *value)
 void draw_settings(int sel, const char *gid)
 {
 	// val must hold the LONGEST value string any row renders — currently Intro Video
-	// Skip's "ON - Time capture next boot" (27 bytes with the NUL). It was 24 and that
-	// sprintf ran off the end into line[]/header[], garbling the whole screen (v667).
+	// Skip's "ON - Time capture next boot" (27 bytes with the NUL).
 	char line[64], val[40], header[80];
-	const char *t  = "Settings";
 	const char *gt = "Game specific Settings";
-	// Rows 2 apart vertically; per-game section header keeps a 3-row gap on
-	// either side for visual separation from the global settings above it.
-	// Shifted down by 1 row to give the Settings banner more space at the top.
-	int r1 = 6, r2 = 8, r3 = 10, r4 = 12, r5 = 14, r6 = 16, r7 = 18, r8 = 20, gr = 23, r9 = 25, r10 = 27, r11 = 29;
+	// Global rows sel 1..8, then the per-game section sel 9..13. Rows 2 apart.
+	int r1 = 4, r2 = 6, r3 = 8, r4 = 10, r5 = 12, r6 = 14, r7 = 16, r8 = 18, gr = 20, r9 = 22, r10 = 24, r11 = 26, r12 = 28, r13 = 30;
 
 	format_game_header(header, gid);
-	draw_screen_chrome(header, "Up/Dn sel  L/R change  Tri/X stable/time  O Return");
-	dbg_text((60 - (int)strlen(t)) / 2, 3, BR_CYAN, BR_BG, t);
+	draw_screen_chrome(header, "Up/Dn sel  L/R change  R:Help  Tri/X adjust  O Return");
 
-	// Row 1: Default Slot (global).
+	// sel 1: Default Slot (global).
 	settings_line(line, "Default Slot:", g_default_slot ? "Last" : "New");
 	draw_settings_row(r1, sel == 1, line);
 
-	// Row 2: Show FPS (GLOBAL, both builds) — live counter drawn during actual
-	// gameplay (menu closed) via the sceDisplaySetFrameBuf/vblank hooks and
-	// fps_poll_thread. Off / On 1s / On 0.5s / On 0.2s — the number is how often
-	// fps_tick() recomputes the displayed value (fps_window_us()). See
-	// install_fps_overlay_hook / fps_display_set_frame_buf_patched.
+	// sel 2: Show FPS (GLOBAL) — combines the old FPS / 1% Lows / Frametime toggles.
+	// L/R cycles the mode; Tri/X set the update rate (fps_window_us). The 1% and
+	// Frametime flags are DERIVED from the mode (see the sel==2 handler / load_settings).
 	{
-		static const char *fps_name[4] = { "OFF", "On 1s", "On 0.5s", "On 0.2s" };
-		settings_line(line, "Show FPS:", fps_name[(g_show_fps_overlay >= 0 && g_show_fps_overlay <= 3) ? g_show_fps_overlay : 0]);
+		static const char *fps_mode[4] = { "OFF", "FPS", "FPS + 1%", "FPS + 1% + Frametime" };
+		const char *mn = fps_mode[(g_show_fps_overlay >= 0 && g_show_fps_overlay <= 3) ? g_show_fps_overlay : 0];
+		if (g_show_fps_overlay > 0)
+			sprintf(line, "%-20s< %s >  %d.%ds", "Show FPS:", mn, g_fps_rate / 10, g_fps_rate % 10);
+		else
+			sprintf(line, "%-20s< %s >", "Show FPS:", mn);
 	}
 	draw_settings_row(r2, sel == 2, line);
 
-	// Row 3: FPS 1% Lows (GLOBAL, both builds) — also draws the average FPS of the
-	// slowest 1% of recent frames (a stutter/worst-case metric) alongside the main
-	// FPS number. Only has any visible effect while Show FPS is also On. See
-	// fps_calc_1pct_low / g_fps_show_lows.
-	settings_line(line, "FPS 1% Lows:", g_fps_show_lows ? "On" : "OFF");
+	// sel 3: Overlay Location (GLOBAL, settings.cfg [9]) — corner anchor for the
+	// FPS/battery/CPU overlay. Down modes keep the SAME top-to-bottom order
+	// (FPS first ... battery last), just anchored on the bottom edge.
+	{
+		static const char *ov_pos[4] = { "Up Left", "Up Right", "Down Left", "Down Right" };
+		settings_line(line, "Overlay Location:", ov_pos[(g_overlay_pos >= 0 && g_overlay_pos <= 3) ? g_overlay_pos : 0]);
+	}
 	draw_settings_row(r3, sel == 3, line);
 
-	// Row 4: Frametime Chart (GLOBAL, both builds) — full-width scrolling
-	// frametime histogram, one column per frame; see ft_chart_tick/ft_chart_draw.
-	// Independent of Show FPS — ticks and draws even if that's off.
-	settings_line(line, "Frametime Chart:", g_show_ft_chart ? "On" : "OFF");
+	// sel 4: CPU & GPU Usage (GLOBAL) — CPU via idle-clocks, GPU via GE busy-duty-cycle.
+	settings_line(line, "CPU & GPU Usage:", g_show_cpu_usage ? "On" : "OFF");
 	draw_settings_row(r4, sel == 4, line);
 
-	// Row 5: CPU & GPU Usage (GLOBAL, both builds) — CPU via idle-clocks,
-	// GPU via GE busy-duty-cycle sampling. One toggle drives both.
-	settings_line(line, "CPU & GPU Usage:", g_show_cpu_usage ? "On" : "OFF");
-	draw_settings_row(r5, sel == 5, line);
-
-	// Row 6: Battery Status (GLOBAL, both builds) — live overlay drawn by the
-	// same poll thread as the FPS counter. Off / Percent / Percent+Time / ALL
-	// (the extra telemetry tier — see the block comment above battery_refresh).
+	// sel 5: Battery Status (GLOBAL) — L/R cycles the mode; Tri/X set the real battery
+	// capacity (the mAh readout + time are scaled to it — see g_batt_real_mah).
 	{
 		static const char *batt_name[4] = { "OFF", "Percent", "Percent+Time", "ALL" };
-		settings_line(line, "Battery Status:", batt_name[(g_show_battery >= 0 && g_show_battery <= 3) ? g_show_battery : 0]);
+		const char *bn = batt_name[(g_show_battery >= 0 && g_show_battery <= 3) ? g_show_battery : 0];
+		char cap[20];
+		if (g_batt_real_mah > 0) sprintf(cap, "(Batt %dmAh)", g_batt_real_mah);
+		else                     strcpy(cap, "(Stock mAh)");
+		sprintf(line, "%-20s< %s >  %s", "Battery Status:", bn, cap);
+	}
+	draw_settings_row(r5, sel == 5, line);
+
+	// sel 6: Stop Charging (GLOBAL) — L/R cycles OFF / 95 / 90 / 85 / 80 / 75 / 70 / ON.
+	// While set, charging is forbidden at/above the threshold (see
+	// battery_charge_gate in sysstats.c) so a cell parked on AC holds that %.
+	// ON (internal 100) forbids charging unconditionally.
+	{
+		static const char *sc_name[8] = { "OFF", "95%", "90%", "85%", "80%", "75%", "70%", "ON" };
+		int sc = 0;   // 0=OFF, 1..6 = 95..70, 7=ON (internal 100)
+		if      (g_batt_stop_charge >= 100) sc = 7;
+		else if (g_batt_stop_charge >= 95) sc = 1;
+		else if (g_batt_stop_charge >= 90) sc = 2;
+		else if (g_batt_stop_charge >= 85) sc = 3;
+		else if (g_batt_stop_charge >= 80) sc = 4;
+		else if (g_batt_stop_charge >= 75) sc = 5;
+		else if (g_batt_stop_charge >= 70) sc = 6;
+		settings_line(line, "Stop Charging:", sc_name[sc]);
 	}
 	draw_settings_row(r6, sel == 6, line);
 
-	// Row 7: Overclock (GLOBAL, both builds — raw PLL registers, PSP-1000 only; see
-	// the oc_* block above load_settings). 0 = stock 333MHz.
+	// sel 7: Overclock (GLOBAL — raw PLL registers, PSP-1000 only). 0 = stock 333MHz.
 	{
 		int idx = (g_overclock_id >= 0 && g_overclock_id < OC_STEPS) ? g_overclock_id : 0;
 		int mhz10 = g_oc_freq_x10[idx];
@@ -1012,10 +1097,8 @@ void draw_settings(int sel, const char *gid)
 		draw_settings_row(r7, sel == 7, line);
 	}
 
-	// Row 8: Debug Messages (GLOBAL, debug builds only) — merged with UART Log.
-	// Display modes: 0=OFF, 1=Log MS, 2=Log Screen, 3=Screen and MS, 4=UART.
-	// Internal: 0-3 map to g_show_debug, 4 = (g_uart_log=1, g_show_debug=0).
-	// (On release builds, this is compiled out.)
+	// sel 8: Debug Messages (GLOBAL, debug builds only) — merged with UART Log.
+	// 0=OFF 1=Log MS 2=Log Screen 3=Screen and MS 4=UART.
 #if DEBUG_BUILD
 	{
 		static const char *dbg_modes[5] = { "OFF", "Log MS", "Log Screen", "Screen and MS", "UART" };
@@ -1027,25 +1110,41 @@ void draw_settings(int sel, const char *gid)
 
 	dbg_text((60 - (int)strlen(gt)) / 2, gr, BR_CYAN, BR_BG, gt);   // per-game section header
 
-	// Row 9: Intro Video Skip (PER-GAME, gameset.cfg) — see the video_skip_* block.
-	// Three states: OFF / learn the window on the next boot / fire the learned window.
+	// Per-game section sel 9..13: Screen Tuning, FPS unlocks, Frame Limit, Intro
+	// Video Skip, Auto-Open (the input handlers in run_settings_menu use these numbers).
+
+	// sel 9: Screen Tuning (PER-GAME, screen.cfg) — Triangle = test pattern, X = live HUD.
+	sprintf(val, "Gamma %d.%02d  Temp %d", g_st_gamma / 100, g_st_gamma % 100, g_st_temp);
+	settings_line(line, "Screen Tuning:", val);
+	draw_settings_row(r9, sel == 9, line);
+
+	// sel 10: FPS unlocks (PER-GAME, fps.cfg) — L/R cycles Stock / <DB cheat names>.
+	// With no DB / no FPS cheats the row shows the empty-state labels instead.
+	{
+		const char *nm = cheats_fps_name(g_fps_active);
+		char nb[40];
+		if ((int)strlen(nm) > 34) { memcpy(nb, nm, 34); nb[34] = 0; nm = nb; }
+		settings_line(line, "FPS unlocks:", nm);
+	}
+	draw_settings_row(r10, sel == 10, line);
+
+	// sel 11: Frame Limit (PER-GAME, gameset.cfg) — OFF or a 25..60 FPS cap.
+	if (g_frame_limit > 0) sprintf(val, "%d FPS", g_frame_limit);
+	else                   sprintf(val, "OFF");
+	settings_line(line, "Frame Limit:", val);
+	draw_settings_row(r11, sel == 11, line);
+
+	// sel 12: Intro Video Skip (PER-GAME, gameset.cfg) — OFF / learn / fire.
 	if (g_video_skip == VSKIP_CAPTURE)    sprintf(val, "ON - Time capture next boot");
 	else if (g_video_skip == VSKIP_TIMED) sprintf(val, "ON - %d.%ds", g_video_skip_ms / 1000,
 	                                              (g_video_skip_ms % 1000) / 100);
 	else                                  sprintf(val, "OFF");
 	settings_line(line, "Intro Video Skip:", val);
-	draw_settings_row(r9, sel == 9, line);
+	draw_settings_row(r12, sel == 12, line);
 
-	// Row 10: Auto-Open on Boot (PER-GAME, gameset.cfg).
+	// sel 13: Auto-Open on Boot (PER-GAME, gameset.cfg).
 	settings_line(line, "Auto-Open on Boot:", g_autoload ? "Yes" : "OFF");
-	draw_settings_row(r10, sel == 10, line);
-
-	// Row 11: Frame Limit (PER-GAME, gameset.cfg) — OFF or a 25..60 FPS cap,
-	// enforced by frame_limit_wait in the present hook. See g_frame_limit.
-	if (g_frame_limit > 0) sprintf(val, "%d FPS", g_frame_limit);
-	else                   sprintf(val, "OFF");
-	settings_line(line, "Frame Limit:", val);
-	draw_settings_row(r11, sel == 11, line);
+	draw_settings_row(r13, sel == 13, line);
 
 	// RAM usage readout (three figures, bottom of the screen above the help line).
 	{
@@ -1054,7 +1153,7 @@ void draw_settings(int sel, const char *gid)
 		// Compact to fit 60 cols even with a multi-MB Free value.
 		sprintf(rl, "RAM:  Plugin static %uK  dynamic %uK  Free %uK",
 		        (unsigned)s_kb, (unsigned)d_kb, (unsigned)f_kb);
-		dbg_text((60 - (int)strlen(rl)) / 2, 31, BR_GREY, BR_BG, rl);   // row 31: one-row gap above the footer (was 32, touching it)
+		dbg_text((60 - (int)strlen(rl)) / 2, 32, BR_GREY, BR_BG, rl);   // just above the hint bar (row 33)
 	}
 }
 
@@ -1067,24 +1166,559 @@ void draw_settings(int sel, const char *gid)
 // period 4=160ms. Capped at period 4 (160ms max) to control speed.
 static int fl_repeat_fire(int hold)
 {
-	if (hold <= 1) return 1;          // initial press
-	if (hold < 8)  return 0;          // ~320ms delay before auto-repeat kicks in
+	if (hold < 5)  return 0;          // activation pause: frames 1-4 (~200ms at 40ms/tick)
+	if (hold == 5) return 1;          // initial press on frame 5
+	if (hold < 9)  return 0;          // delay before auto-repeat (~160ms)
 	{
-		int period = (hold >= 20) ? 5 : 6;
-		return ((hold - 8) % period) == 0;
+		int period = (hold >= 24) ? 2 : 3;
+		return ((hold - 9) % period) == 0;
 	}
 }
 
-static void run_settings_menu(const char *gid)
+// ── Gamma test pattern (Triangle on the IPS Gamma Fix row) ──────────────────
+// Full-screen calibration chart, generated procedurally — nothing is stored (a
+// 480x272 16-bit image would be ~255KB, larger than the whole plugin, and this
+// is a kernel module). Six 40px bands, top to bottom:
+//   0. true gradient 0..255      — continuous ramp: smoothness + banding
+//   1. 16-step wedge 0..255      — the same range quantized, for step-to-step reading
+//   2. shadow ramp | highlight ramp — the two ends the curve must NOT move
+//   3. primaries + secondaries   — hue shift (the pass is per-channel)
+//   4. mid-saturation patches    — where the lift is strongest
+//   5. pure black | pure white   — clamp reference, both must stay pinned
+// The bottom 32px are left clear for the value banner + hint, which run_st_test
+// draws AFTER the GE pass so the UI itself stays uncorrected.
+// Drawn through dbg_fill_rect rather than raw u32 stores: it carries the REAL
+// stride (dbg_bufw, not a hardcoded 512) and packs each color to the game's own
+// pixel format — a 5551/565 game would otherwise render this garbled at half
+// width. Stays inside 480x272 (dbg_fill_rect does NOT clamp; see the
+// out-of-bounds note in gfx.c).
+#define GT_RGB(r, g, b) (0xFF000000u | ((u32)(b) << 16) | ((u32)(g) << 8) | (u32)(r))   // AABBGGRR, R low
+#define GT_BAND 40                    // band height; 6 bands = 240, leaving 32px for the overlay
+
+static void st_test_pattern(void)
+{
+	static const u8  shadow[8] = {   0,   4,   8,  12,  16,  20,  24,  28 };
+	static const u8  highl [8] = { 227, 231, 235, 239, 243, 247, 251, 255 };
+	static const u32 prim  [6] = { GT_RGB(255,0,0),   GT_RGB(0,255,0),     GT_RGB(0,0,255),
+	                               GT_RGB(0,255,255), GT_RGB(255,0,255),   GT_RGB(255,255,0) };
+	static const u32 mid   [6] = { GT_RGB(255,128,0), GT_RGB(224,172,138), GT_RGB(0,128,128),
+	                               GT_RGB(128,0,128), GT_RGB(128,128,0),   GT_RGB(128,128,128) };
+	int i, v;
+
+	for (i = 0; i < 480; i++) {                    // 0. true gradient, one column per pixel
+		v = i * 255 / 479;                         // both ends exact: 0 at x=0, 255 at x=479
+		dbg_fill_rect(i, 0, 1, GT_BAND, GT_RGB(v, v, v));
+	}
+	for (i = 0; i < 16; i++) {                     // 1. wedge, 16 x 30px
+		v = i * 17;
+		dbg_fill_rect(i * 30, GT_BAND, 30, GT_BAND, GT_RGB(v, v, v));
+	}
+	for (i = 0; i < 8; i++) {                      // 2. shadows left, highlights right
+		v = shadow[i]; dbg_fill_rect(      i * 30, GT_BAND * 2, 30, GT_BAND, GT_RGB(v, v, v));
+		v = highl[i];  dbg_fill_rect(240 + i * 30, GT_BAND * 2, 30, GT_BAND, GT_RGB(v, v, v));
+	}
+	for (i = 0; i < 6; i++) {                      // 3. + 4. color rows, 6 x 80px
+		dbg_fill_rect(i * 80, GT_BAND * 3, 80, GT_BAND, prim[i]);
+		dbg_fill_rect(i * 80, GT_BAND * 4, 80, GT_BAND, mid[i]);
+	}
+	dbg_fill_rect(  0, GT_BAND * 5, 240, GT_BAND, GT_RGB(  0,   0,   0));   // 5. clamp reference
+	dbg_fill_rect(240, GT_BAND * 5, 240, GT_BAND, GT_RGB(255, 255, 255));
+	// Overlay strip: cleared to the menu background so the banner/hint drawn on
+	// top of it after the pass sit on a known, uncorrected ground.
+	dbg_fill_rect(0, GT_BAND * 6, 480, 272 - GT_BAND * 6, BR_BG);
+}
+
+// The test screen. The pass is IN-PLACE, so every change redraws the pattern
+// from scratch before re-applying — re-running it over an already-corrected
+// screen would compound the curve instead of replacing it. Returns 1 if the
+// value changed (caller persists it).
+static int run_st_test(void)
+{
+	SceCtrlData pad;
+	int prev, changed = 0, redraw = 1;
+	// Auto-repeat state for gamma and temp (like Frame Limit in settings menu).
+	int g_hold = 0, g_hold_dir = 0, t_hold = 0, t_hold_dir = 0;
+
+	kpeek(&pad); prev = pad.Buttons;
+	for (;;) {
+		int pressed;
+		if (redraw) {
+			char line[64], val[16];
+			int applied;
+			redraw = 0;
+			st_test_pattern();                                      // fresh, uncorrected
+			applied = st_apply_test(dbg_fb, dbg_bufw, dbg_pfmt);    // curve it in place
+			{
+				const char *f = applied ? "L/R:temp  U/D:gamma  Tri/O:exit"
+				                        : "GE busy - UNCORRECTED  Tri/O:exit";
+				dbg_text((60 - (int)strlen(f)) / 2, 29, BR_GREY, BR_BG, f);
+			}
+			// Colour temp row (y240..256)
+			if      (g_st_temp < 100) sprintf(val, "%d (warm)", g_st_temp);
+			else if (g_st_temp > 100) sprintf(val, "%d (cool)", g_st_temp);
+			else                       sprintf(val, "neutral");
+			settings_line(line, "Color Temp:", val);
+			draw_settings_row(30, 1, line);
+			// Gamma row (y256..272) — displayed as standard gamma (0.50..2.00).
+			sprintf(val, "%d.%02d", g_st_gamma / 100, g_st_gamma % 100);
+			settings_line(line, "Gamma:", val);
+			draw_settings_row(32, 1, line);
+		}
+		sceKernelDelayThread(40000);
+		kpeek(&pad);
+		pressed = pad.Buttons & ~prev;
+		prev = pad.Buttons;
+
+		// Colour temp: L/R with auto-repeat
+		{
+			int dir = (pad.Buttons & PSP_CTRL_RIGHT) ? +1 :
+			          (pad.Buttons & PSP_CTRL_LEFT)  ? -1 : 0;
+			if (dir != 0) {
+				if (dir != t_hold_dir) { t_hold = 0; t_hold_dir = dir; }
+				t_hold++;
+				if (fl_repeat_fire(t_hold)) {
+					if (dir > 0 && g_st_temp < 200) { g_st_temp++; changed = 1; redraw = 1; }
+					if (dir < 0 && g_st_temp > 0)   { g_st_temp--; changed = 1; redraw = 1; }
+					// Temperature alone drives the pass now (st_active), so this row
+					// has to be able to start the worker just like the gamma row.
+					if (st_active()) st_ensure_started();
+				}
+			} else {
+				if (t_hold >= 1 && t_hold < 5) {
+					if (t_hold_dir > 0 && g_st_temp < 200) { g_st_temp++; changed = 1; redraw = 1; }
+					if (t_hold_dir < 0 && g_st_temp > 0)   { g_st_temp--; changed = 1; redraw = 1; }
+					if (st_active()) st_ensure_started();
+				}
+				t_hold = 0; t_hold_dir = 0;
+			}
+		}
+		// Gamma: UP/DOWN with auto-repeat (UP = brighter, DOWN = darker).
+		{
+			int dir = (pad.Buttons & PSP_CTRL_DOWN) ? +1 :
+			          (pad.Buttons & PSP_CTRL_UP)   ? -1 : 0;
+			if (dir != 0) {
+				if (dir != g_hold_dir) { g_hold = 0; g_hold_dir = dir; }
+				g_hold++;
+				if (fl_repeat_fire(g_hold)) {
+					if (dir > 0 && g_st_gamma > 50)  { g_st_gamma--; changed = 1; redraw = 1; }
+					if (dir < 0 && g_st_gamma < 200) { g_st_gamma++; changed = 1; redraw = 1; }
+					if (st_active()) st_ensure_started();
+				}
+			} else {
+				if (g_hold >= 1 && g_hold < 5) {
+					if (g_hold_dir > 0 && g_st_gamma > 50)  { g_st_gamma--; changed = 1; redraw = 1; }
+					if (g_hold_dir < 0 && g_st_gamma < 200) { g_st_gamma++; changed = 1; redraw = 1; }
+					if (st_active()) st_ensure_started();
+				}
+				g_hold = 0; g_hold_dir = 0;
+			}
+		}
+		if (pressed & (PSP_CTRL_TRIANGLE | PSP_CTRL_CIRCLE)) break;
+	}
+	st_guard_reset();
+	return changed;
+}
+
+// Live gamma HUD banner, drawn over the RUNNING game (X on the gamma settings
+// row). Same row styling as the settings screen so the value reads identically,
+// parked at the bottom. Called from the present hook and — for games that never
+// present through it — the gamma worker; both call it AFTER the GE pass, so the
+// banner itself stays uncorrected. Adopts the caller's buffer geometry exactly
+// like fps_draw does.
+void st_hud_draw(void *topaddr, int bufw, int pfmt)
+{
+	char line[64], val[16];
+	if (!topaddr || bufw <= 0) return;
+	dbg_fb   = (void *)(0xA0000000 | (u32)topaddr);
+	dbg_bufw = bufw;
+	dbg_pfmt = pfmt;
+	// Hint (y208..216).
+	dbg_text(4, 26, BR_WHITE, BR_BG, "L/R:temp  U/D:gamma  X/O:done");
+	// Colour temp (y224..240).
+	if      (g_st_temp < 100) sprintf(val, "%d (warm)", g_st_temp);
+	else if (g_st_temp > 100) sprintf(val, "%d (cool)", g_st_temp);
+	else                       sprintf(val, "neutral");
+	settings_line(line, "Color Temp:", val);
+	draw_settings_row(28, 1, line);
+	// Gamma (y240..256) — standard gamma value (0.50..2.00).
+	sprintf(val, "%d.%02d", g_st_gamma / 100, g_st_gamma % 100);
+	settings_line(line, "Gamma:", val);
+	draw_settings_row(30, 1, line);
+}
+
+// ── Per-setting explanation pages (R in the Settings menu) ─────────────────
+// R on a highlighted settings row opens a full-screen page describing what that
+// setting does, how it works, and when to use (or avoid) it. O or R closes and
+// returns to the settings list. `sel` is the same row number the input handlers
+// use (see draw_settings / run_settings_menu). Drawn with the same chrome as
+// every other menu page. Only a debug-build row can ever be 7 (Release hides it
+// but still lets it be selected, so the page stays reachable for completeness).
+// A single help-page line: text + colour + left column. Colour is used to turn
+// each page from one flat white block into a scannable layout: BR_CYAN section
+// headers, BR_WHITE body/options, BR_RED cautions. col 3 = body, col 5 = items.
+struct exline { const char *t; u32 fg; int col; };
+#define EX(t, fg, col) { (t), (fg), (col) }
+#define EXH(t)  EX((t), BR_CYAN, 3)    // section header
+#define EXB(t)  EX((t), BR_WHITE, 3)   // body text
+#define EXI(t)  EX((t), BR_WHITE, 5)   // indented option/item
+#define EXC(t)  EX((t), BR_RED, 3)     // caution / important note
+#define EXS(t)  EX("", 0, 0)           // spacer (blank line)
+
+static void explain_page(const char *title, const struct exline *ln, int n)
+{
+	int i;
+	draw_screen_chrome(title, "O/R: Back");
+	// Body starts two rows below the header chrome (row 5), giving the page
+	// breathing room under the title + accent line.
+	for (i = 0; i < n; i++)
+		if (ln[i].t[0]) dbg_text(ln[i].col, 5 + i, ln[i].fg, BR_BG, ln[i].t);
+}
+
+static void settings_explain(int sel)
+{
+	switch (sel) {
+	case 1: {
+		static const struct exline b[] = {
+			EXB("Which entry is highlighted when the"),
+			EXB("save/load menu first opens."),
+			EXS(),
+			EXH("MODES"),
+			EXI("Last - newest save (quickest to load)"),
+			EXI("New  - the 'New Savegame' row, ready"),
+			EXI("       to make a save."),
+			EXS(),
+			EXH("SCOPE"),
+			EXB("Applies to every game."),
+		};
+		explain_page("Default Slot", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	case 2: {
+		static const struct exline b[] = {
+			EXB("Shows a live FPS counter (and optional"),
+			EXB("extras) on screen during gameplay."),
+			EXS(),
+			EXH("MODES  (L/R cycles)"),
+			EXI("OFF          - no overlay"),
+			EXI("FPS          - frames per second"),
+			EXI("FPS + 1%     - adds the 1% Low"),
+			EXI("               (worst-stutter figure)"),
+			EXI("FPS+1%+Frame - adds a scrolling"),
+			EXI("               frametime chart"),
+			EXS(),
+			EXH("CONTROLS"),
+			EXI("Tri/X set the update rate (0.1-1.0s)."),
+			EXS(),
+			EXH("SCOPE"),
+			EXB("Applies to every game."),
+			EXS(),
+			EXH("TIP"),
+			EXI("Handy to check a game's performance;"),
+			EXI("costs a little CPU. Turn OFF if unused."),
+		};
+		explain_page("Show FPS", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	case 3: {
+		static const struct exline b[] = {
+			EXB("Where the FPS / battery / CPU overlay"),
+			EXB("box is anchored on screen."),
+			EXS(),
+			EXH("OPTIONS  (L/R cycles)"),
+			EXI("Up Left / Up Right"),
+			EXI("Down Left / Down Right"),
+			EXS(),
+			EXB("The box keeps the same top-to-bottom"),
+			EXB("order (FPS first ... battery last),"),
+			EXB("just pinned to the chosen corner."),
+			EXS(),
+			EXH("SCOPE"),
+			EXB("Applies to every game."),
+			EXS(),
+			EXH("TIP"),
+			EXI("Pick a corner that does not cover game"),
+			EXI("HUD info you want to read."),
+		};
+		explain_page("Overlay Location", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	case 4: {
+		static const struct exline b[] = {
+			EXB("Shows the PSP's CPU and GPU load as"),
+			EXB("a percentage, overlaid during play."),
+			EXS(),
+			EXH("HOW IT'S MEASURED"),
+			EXI("CPU - from idle-thread clock time."),
+			EXI("GPU - from the Graphics Engine's"),
+			EXI("      busy duty-cycle."),
+			EXS(),
+			EXH("SCOPE"),
+			EXB("Applies to every game."),
+			EXS(),
+			EXH("TIP"),
+			EXI("See which part is the bottleneck"),
+			EXI("(CPU vs GPU). Adds a small per-frame"),
+			EXI("cost; turn OFF when unused."),
+		};
+		explain_page("CPU & GPU Usage", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	case 5: {
+		static const struct exline b[] = {
+			EXB("Shows a live battery readout during"),
+			EXB("gameplay."),
+			EXS(),
+			EXH("MODES  (L/R cycles)"),
+			EXI("OFF           - no battery overlay"),
+			EXI("Percent       - charge %"),
+			EXI("Percent+Time  - adds time estimate"),
+			EXI("ALL           - every reading"),
+			EXS(),
+			EXH("CONTROLS"),
+			EXI("Tri/X set the REAL battery capacity"),
+			EXI("(mAh). The PSP's own meter caps near"),
+			EXI("~1800mAh even with a bigger cell, so"),
+			EXI("set your cell's real size for an"),
+			EXI("accurate % and time."),
+			EXS(),
+			EXH("SCOPE"),
+			EXB("Applies to every game."),
+		};
+		explain_page("Battery Status", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	case 6: {
+		static const struct exline b[] = {
+			EXB("Stops the battery from charging once"),
+			EXB("it reaches the set level, so a cell"),
+			EXB("parked on AC does not sit at 100%."),
+			EXS(),
+			EXH("VALUES  (L/R cycles)"),
+			EXI("OFF - charge normally (default)"),
+			EXI("95 / 90 / 85 / 80 / 75 / 70 % -"),
+			EXI("  charging is blocked at/above"),
+			EXI("  the threshold"),
+			EXI("ON - never charge (runs from AC)"),
+			EXS(),
+			EXH("HOW IT WORKS"),
+			EXI("The battery poll thread tells the"),
+			EXI("power controller to forbid charging"),
+			EXI("once the level is reached, and to"),
+			EXI("permit it again below it. The PSP"),
+			EXI("then runs from AC while the battery"),
+			EXI("holds its charge."),
+			EXS(),
+			EXH("SCOPE"),
+			EXB("Applies to every game."),
+			EXS(),
+			EXH("TIP"),
+			EXI("Lithium cells age fastest sitting"),
+			EXI("full at high temperature. 80-90% is"),
+			EXI("a good parking level for long"),
+			EXI("plug-in sessions."),
+			EXS(),
+			EXC("NOTE: works only while the plugin's"),
+			EXC("battery thread is running (it is"),
+			EXC("started automatically when this is"),
+			EXC("set). A PSP reboot clears the forbid"),
+			EXC("state."),
+		};
+		explain_page("Stop Charging", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	case 7: {
+		static const struct exline b[] = {
+			EXB("Raises the CPU clock above stock by"),
+			EXB("writing the raw PLL registers."),
+			EXS(),
+			EXH("VALUES  (L/R cycles)"),
+			EXI("OFF      - stock 333 MHz (safe)"),
+			EXI("<higher> - faster, but hotter and"),
+			EXI("           less stable; a too-high"),
+			EXI("           step can hang or crash."),
+			EXS(),
+			EXC("NOTE: Ark-4's own 'Game overclock'"),
+			EXC("setting must be set to 'Overclocked'"),
+			EXC("for this to take effect."),
+			EXS(),
+			EXB("Triangle marks a step 'Stable' (skips"),
+			EXB("the every-boot confirm); X clears it."),
+			EXS(),
+			EXH("SCOPE"),
+			EXB("Applies to every game."),
+			EXS(),
+			EXC("Use only a step proven stable on your"),
+			EXC("unit. When in doubt, leave OFF."),
+		};
+		explain_page("Overclock", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	case 8: {
+		static const struct exline b[] = {
+			EXB("Controls the plugin's debug output."),
+			EXB("Only present in debug builds (a"),
+			EXB("release build is silent)."),
+			EXS(),
+			EXH("MODES  (L/R cycles)"),
+			EXI("OFF           - no logging"),
+			EXI("Log MS        - to a Memory Stick file"),
+			EXI("Log Screen    - checkpoints on screen"),
+			EXI("Screen and MS - both"),
+			EXI("UART          - to the PC serial port"),
+			EXS(),
+			EXB("Used for development / diagnosing"),
+			EXB("save+load issues."),
+			EXS(),
+			EXH("SCOPE"),
+			EXB("Applies to every game."),
+			EXS(),
+			EXC("You normally do NOT need this on."),
+		};
+		explain_page("Debug Messages", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	case 9: {
+		static const struct exline b[] = {
+			EXB("Adjusts the picture a game shows,"),
+			EXB("saved per game."),
+			EXS(),
+			EXH("WHAT YOU TUNE"),
+			EXI("Gamma - brightness curve (0.50..2.00)"),
+			EXI("Temp  - colour temperature (warm..cool)"),
+			EXS(),
+			EXH("HOW IT'S APPLIED"),
+			EXB("The correction is blended over each"),
+			EXB("displayed frame by the graphics engine."),
+			EXS(),
+			EXH("BUTTONS"),
+			EXI("Triangle - full-screen test pattern"),
+			EXI("X        - live HUD over the real game"),
+			EXS(),
+			EXH("SCOPE"),
+			EXB("Per-game: each game keeps its own value."),
+			EXS(),
+			EXH("WHY"),
+			EXI("Fix a too-dark screen or a colour cast"),
+			EXI("without the game's own (often absent)"),
+			EXI("picture options."),
+		};
+		explain_page("Screen Tuning", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	case 10: {
+		static const struct exline b[] = {
+			EXB("Applies FPS-unlock codes from a cheat"),
+			EXB("DB so a game can run above its cap."),
+			EXS(),
+			EXH("MODES  (L/R cycles)"),
+			EXI("Stock - no unlock (normal limit)."),
+			EXI("With cheat.db present, the list shows"),
+			EXI("the unlock names found for THIS game."),
+			EXS(),
+			EXH("SCOPE"),
+			EXB("Per-game: stored per game folder."),
+			EXS(),
+			EXH("CHEAT.DB"),
+			EXI("Put cheat.db in ms0:/seplugins/ or"),
+			EXI("ms0:/seplugins/SAVESTATE/ to provide"),
+			EXI("the codes."),
+			EXS(),
+			EXC("Unlocking can break some games (physics"),
+			EXC("runs faster) - test before relying on it."),
+		};
+		explain_page("FPS unlocks", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	case 11: {
+		static const struct exline b[] = {
+			EXB("Caps the game's frame rate to a fixed"),
+			EXB("target (OFF or 20..60 FPS) by pacing"),
+			EXB("inside the present hook."),
+			EXS(),
+			EXB("A stable cap often reads smoother than a"),
+			EXB("fluctuating higher number (e.g. a game"),
+			EXB("that swings 30-60)."),
+			EXS(),
+			EXH("SCOPE"),
+			EXB("Per-game: stored per game folder."),
+			EXS(),
+			EXH("NOTE"),
+			EXI("The panel is 60Hz, so only 60/30/20 are"),
+			EXI("judder-free; 25/35/40/... will judder"),
+			EXI("somewhat."),
+			EXS(),
+			EXH("WHY"),
+			EXI("Even out a swinging title, or save"),
+			EXI("battery / reduce heat."),
+		};
+		explain_page("Frame Limit", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	case 12: {
+		static const struct exline b[] = {
+			EXB("Skips a game's intro / maker videos"),
+			EXB("automatically on the NEXT boot."),
+			EXS(),
+			EXH("HOW IT SKIPS"),
+			EXI("- instantly, via a small script patch"),
+			EXI("  on the video player API"),
+			EXI("- by pulsing the game's OWN skip"),
+			EXI("  button (X / START) for the rest"),
+			EXS(),
+			EXH("MODES  (L/R cycles)"),
+			EXI("OFF     - never skip"),
+			EXI("capture - learn the intro's length on"),
+			EXI("          the next boot"),
+			EXI("<time>  - skip once the window is"),
+			EXI("          learned"),
+			EXS(),
+			EXH("CAPTURE"),
+			EXI("On the next boot hold D-Pad Right until"),
+			EXI("the intro has played; it records how"),
+			EXI("long to skip."),
+			EXS(),
+			EXH("SCOPE"),
+			EXB("Per-game: stored per game folder."),
+			EXS(),
+			EXH("WHY"),
+			EXI("Great for games with long, unskippable"),
+			EXI("intros."),
+		};
+		explain_page("Intro Video Skip", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	default: {   // sel 13 (and any unexpected value): Auto-Open on Boot
+		static const struct exline b[] = {
+			EXB("When ON, the save/load menu opens by"),
+			EXB("itself shortly after this game boots"),
+			EXB("(if the game has at least one save) -"),
+			EXB("so you can load before the title/intro"),
+			EXB("plays."),
+			EXS(),
+			EXH("SCOPE"),
+			EXB("Per-game: stored per game folder."),
+			EXS(),
+			EXH("TIP"),
+			EXI("Turn it on for games you load often;"),
+			EXI("leave OFF if you would rather open the"),
+			EXI("menu manually."),
+			EXS(),
+			EXC("CAUTION: loading while not in gameplay"),
+			EXC("is risky - be aware of the increased"),
+			EXC("instability, which varies per game."),
+		};
+		explain_page("Auto-Open on Boot", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	}
+	// Let go of the R that opened the page, then wait for O or R to close.
+	wait_buttons_up();
+	wait_button_edge(PSP_CTRL_RTRIGGER | PSP_CTRL_CIRCLE);
+	wait_release(PSP_CTRL_RTRIGGER | PSP_CTRL_CIRCLE);
+}
+
+// Returns 1 if the caller should close the WHOLE menu (X on the gamma row hands
+// the value to the live HUD, which only makes sense with the game running).
+static int run_settings_menu(const char *gid)
 {
 	SceCtrlData pad;
 	int fl_hold = 0, fl_hold_dir = 0;   // Frame-Limit hold state (auto-repeat)
-	// Rows: 1 Default Slot, 2 Show FPS, 3 FPS 1% Lows, 4 Frametime Chart, 5 CPU Usage,
-	// 6 Battery Status, 7 Overclock | 8 Debug Messages (debug builds only) | 9 Video Skip,
-	// 10 Auto-Open, 11 Frame Limit. Row 8 is debug-only; a release starts at 1 = Default Slot
-	// (draw_settings doesn't draw row 8 there). Rows 9-11 are the per-game section (gameset.cfg).
+	// Rows: 1 Default Slot, 2 Show FPS (L/R mode, Tri/X update rate), 3 Overlay
+	// Location, 4 CPU & GPU Usage, 5 Battery Status, 6 Stop Charging, 7 Overclock
+	// | 8 Debug Messages (debug builds only) | 9 Screen Tuning, 10 FPS unlocks,
+	// 11 Frame Limit, 12 Intro Video Skip, 13 Auto-Open. Row 8 is debug-only; a
+	// release keeps it selectable but undrawn (same as before). Rows 9-13 are the
+	// per-game section.
 	const int sel_min = DEBUG_BUILD ? 1 : 1;
-	int sel = sel_min, prev, changed = 0, gchanged = 0;
+	int sel = sel_min, prev, changed = 0, gchanged = 0, close_all = 0;
+	u32 nav_db_us = 0;   // debounce: ignore L/R for 50ms after UP/DOWN nav
 	load_game_settings(gid);   // per-game settings for gid -> g_autoload, g_frame_limit, g_video_skip
 	draw_settings(sel, gid);
 	kpeek(&pad); prev = pad.Buttons;
@@ -1095,17 +1729,41 @@ static void run_settings_menu(const char *gid)
 		pressed = pad.Buttons & ~prev;
 		prev = pad.Buttons;
 
-		// Contiguous rows sel_min..11. Up/Down clamp to that range.
-		if (pressed & PSP_CTRL_UP)   { if (sel > sel_min) sel--; }
-		if (pressed & PSP_CTRL_DOWN) { if (sel < 11)      sel++; }
+		// Contiguous rows sel_min..13. Up/Down WRAP around the ends (Up on the first
+		// row jumps to the last per-game setting, and vice versa).
+		if (pressed & PSP_CTRL_UP)   { sel = (sel > sel_min) ? sel - 1 : 13; }
+		if (pressed & PSP_CTRL_DOWN) { sel = (sel < 13)      ? sel + 1 : sel_min; }
+		// Debounce: after navigation, ignore L/R for 50ms so the user's
+		// thumb rolling off the D-pad doesn't change values on the new row.
+		if (sel != osel) {
+			nav_db_us = sceKernelGetSystemTimeLow() + 50000;
+			// Clear L/R from this iteration's edges AND held state so the
+			// new row isn't immediately adjusted by a stale direction.
+			pressed &= ~(PSP_CTRL_LEFT | PSP_CTRL_RIGHT);
+			pad.Buttons &= ~(PSP_CTRL_LEFT | PSP_CTRL_RIGHT);
+		}
+		if (nav_db_us && (int)(sceKernelGetSystemTimeLow() - nav_db_us) >= 0) {
+			nav_db_us = 0;   // window expired
+		}
+		if (nav_db_us) {
+			pressed &= ~(PSP_CTRL_LEFT | PSP_CTRL_RIGHT);
+			pad.Buttons &= ~(PSP_CTRL_LEFT | PSP_CTRL_RIGHT);
+		}
 
-		// Frame Limit (PER-GAME, row 11): auto-repeat on HOLD (per user request), and the
-		// value LOOPS (OFF -> 20 -> ... -> 60 -> OFF). Level-driven, not edge-driven, so it
-		// sits before the edge-based chain below. Left/Right sweep OFF / 20 / 21 / ... / 60.
-		// Applies live — frame_limit_ge reads g_frame_limit every GE submit. 60, 30 and 20
-		// are the whole-vblank divisors of the 59.94Hz panel; the in-between steps judder a
-		// little but were tried by hand and are for real use (see frame_limit_target_us).
-		if (sel == 11) {
+		// R: explanation page for the currently highlighted setting. Opens a
+		// full-screen "what it does / how / why" page; O or R returns here.
+		if (pressed & PSP_CTRL_RTRIGGER) {
+			settings_explain(sel);
+			draw_settings(sel, gid);
+			kpeek(&pad); prev = pad.Buttons;
+			continue;
+		}
+
+		// Frame Limit (PER-GAME, row 11): auto-repeat on HOLD, and the value LOOPS
+		// (OFF -> 20 -> ... -> 60 -> OFF). Level-driven, not edge-driven, so it sits
+		// before the edge-based chain below. Left/Right sweep OFF / 20 / 21 / ... / 60.
+		// Applies live — frame_limit_ge reads g_frame_limit every GE submit.
+		if (sel == 11) {   // Frame Limit
 			int dir = (pad.Buttons & PSP_CTRL_RIGHT) ? +1 :
 			          (pad.Buttons & PSP_CTRL_LEFT)  ? -1 : 0;
 			if (dir != 0) {
@@ -1130,23 +1788,89 @@ static void run_settings_menu(const char *gid)
 					draw_settings(sel, gid);
 				}
 			} else {
+				if (fl_hold >= 1 && fl_hold < 5) {
+					if (fl_hold_dir > 0) {   // increase, wrap 60 -> OFF
+						if      (g_frame_limit == 0)  g_frame_limit = 20;
+						else if (g_frame_limit >= 60) g_frame_limit = 0;
+						else                          g_frame_limit++;
+					} else {         // decrease, wrap OFF -> 60
+						if      (g_frame_limit == 0)  g_frame_limit = 60;
+						else if (g_frame_limit <= 20) g_frame_limit = 0;
+						else                          g_frame_limit--;
+					}
+					if (DBG_UART()) { char b[64]; sprintf(b, "[FLIMIT] set %d fps (0=off)", g_frame_limit); uart_puts(b); }
+					gchanged = 1;
+					draw_settings(sel, gid);
+				}
 				fl_hold = 0; fl_hold_dir = 0;
 			}
 		}
 
-		// Triangle / X are the "up / down" pair for two rows (Left/Right stays "change value"
-		// elsewhere; X no longer toggles plain settings — that role was removed per request):
-		//   Overclock (row 7, non-stock only): Triangle = mark STABLE (skip the boot confirm,
+		// FPS unlocks (PER-GAME, sel 10): Left/Right cycle Stock / <DB FPS cheats>, wrap.
+		// cheats_fps_cycle persists the choice and (re)starts the per-vblank apply
+		// thread, so no `changed` flag is needed here.
+		if (sel == 10 && (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))) {
+			cheats_fps_cycle((pressed & PSP_CTRL_RIGHT) ? +1 : -1);
+			draw_settings(sel, gid);
+		}
+
+		// Triangle / X are the "up / down" pair on rows that need a second axis
+		// (Left/Right stays "change value" elsewhere):
+		//   Show FPS (row 2, while a mode is on): Triangle = +0.1s, X = -0.1s on the
+		//     update rate (g_fps_rate 1..10 = 0.1..1.0s -> fps_window_us).
+		//   Overclock (row 6, non-stock only): Triangle = mark STABLE (skip the boot confirm,
 		//     shown RED), X = clear it back to the normal white "ask every boot".
-		//   Intro Video Skip (row 9, only once a timer is captured = TIMED): Triangle = +0.1s,
+		//   Intro Video Skip (row 11, only once a timer is captured = TIMED): Triangle = +0.1s,
 		//     X = -0.1s on the learned window (clamped to 0.1s .. VSKIP_LEARN_MAX_MS).
+		if (sel == 2 && g_show_fps_overlay > 0 && (pressed & (PSP_CTRL_TRIANGLE | PSP_CTRL_CROSS))) {
+			if ((pressed & PSP_CTRL_TRIANGLE) && g_fps_rate < 10) g_fps_rate++;
+			if ((pressed & PSP_CTRL_CROSS)    && g_fps_rate > 1)  g_fps_rate--;
+			changed = 1;
+			draw_settings(sel, gid);
+		}
 		if (sel == 7 && g_overclock_id > 0 && (pressed & (PSP_CTRL_TRIANGLE | PSP_CTRL_CROSS))) {
 			if (pressed & PSP_CTRL_TRIANGLE) g_overclock_stable = 1;
 			if (pressed & PSP_CTRL_CROSS)    g_overclock_stable = 0;
 			changed = 1;
 			draw_settings(sel, gid);
 		}
-		if (sel == 9 && g_video_skip == VSKIP_TIMED && (pressed & (PSP_CTRL_TRIANGLE | PSP_CTRL_CROSS))) {
+		// Battery Status (row 5): Triangle/X set the REAL battery capacity in mAh.
+		// 100mAh steps, 1000..8000; X below 1000 returns to Stock (0 = use the BMS value).
+		if (sel == 5 && (pressed & (PSP_CTRL_TRIANGLE | PSP_CTRL_CROSS))) {
+			if (pressed & PSP_CTRL_TRIANGLE) {
+				if (g_batt_real_mah == 0)          g_batt_real_mah = 1000;
+				else if (g_batt_real_mah < 8000)   g_batt_real_mah += 100;
+			}
+			if (pressed & PSP_CTRL_CROSS) {
+				if (g_batt_real_mah <= 1000)       g_batt_real_mah = 0;
+				else                               g_batt_real_mah -= 100;
+			}
+			changed = 1;
+			draw_settings(sel, gid);
+		}
+		// Screen Tuning (sel 9): Triangle opens the full-screen test pattern with
+		// live gamma + colour temp adjustment.  X opens the in-game HUD.
+		if (sel == 9 && (pressed & PSP_CTRL_TRIANGLE)) {
+			// Exit-path checkpoints: last [STX] line before silence = the step.
+			if (DBG_UART()) uart_puts("[STX] test: enter");
+			if (run_st_test()) { changed = 1; st_save_game_gamma(); }   // gamma is per-game
+			if (DBG_UART()) uart_puts("[STX] test: returned");
+			draw_settings(sel, gid);
+			kpeek(&pad); prev = pad.Buttons;
+			if (DBG_UART()) uart_puts("[STX] test: redrawn, back in settings");
+		}
+		// X: tune against the REAL game instead of a chart — close the menu
+		// entirely and leave a HUD on screen that owns the D-Pad until X/O.
+		if (sel == 9 && (pressed & PSP_CTRL_CROSS)) {
+			if (DBG_UART()) uart_puts("[STX] hud: opening");
+			st_ensure_started();   // worker draws the HUD for present-less games + persists edits
+			st_hud_open();
+			if (DBG_UART()) uart_puts("[STX] hud: worker up, hud armed");
+			changed = 1;              // saved below; the HUD's own edits are saved by the worker
+			close_all = 1;
+			break;
+		}
+		if (sel == 12 && g_video_skip == VSKIP_TIMED && (pressed & (PSP_CTRL_TRIANGLE | PSP_CTRL_CROSS))) {
 			if (pressed & PSP_CTRL_TRIANGLE) g_video_skip_ms += 100;
 			if (pressed & PSP_CTRL_CROSS)    g_video_skip_ms -= 100;
 			if (g_video_skip_ms < 100)                 g_video_skip_ms = 100;
@@ -1157,13 +1881,24 @@ static void run_settings_menu(const char *gid)
 		}
 
 		if (sel == 2 && (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))) {
-			// Show FPS: Left/Right cycle Off / On 1s / On 0.5s / On 0.2s (0..3), wrapping.
+			// Show FPS: Left/Right cycle OFF / FPS / FPS + 1% / FPS + 1% + Frametime
+			// (0..3), wrapping. The 1% and chart flags are DERIVED from the mode —
+			// the same mapping load_settings applies (keep both in sync).
 			if (pressed & PSP_CTRL_LEFT)  g_show_fps_overlay = (g_show_fps_overlay > 0) ? g_show_fps_overlay - 1 : 3;
 			if (pressed & PSP_CTRL_RIGHT) g_show_fps_overlay = (g_show_fps_overlay < 3) ? g_show_fps_overlay + 1 : 0;
+			g_fps_show_lows = (g_show_fps_overlay >= 2) ? 1 : 0;
+			g_show_ft_chart = (g_show_fps_overlay >= 3) ? 1 : 0;
 			if (g_show_fps_overlay) fps_poll_ensure_started();
 			changed = 1;
 			draw_settings(sel, gid);
-		} else if (sel == 6 && (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))) {
+		} else if (sel == 3 && (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))) {
+			// Overlay Location: Left/Right cycle Up Left / Up Right / Down Left / Down
+			// Right (0..3), wrapping. Applied live by the next overlay draw (fps_draw).
+			if (pressed & PSP_CTRL_LEFT)  g_overlay_pos = (g_overlay_pos > 0) ? g_overlay_pos - 1 : 3;
+			if (pressed & PSP_CTRL_RIGHT) g_overlay_pos = (g_overlay_pos < 3) ? g_overlay_pos + 1 : 0;
+			changed = 1;
+			draw_settings(sel, gid);
+		} else if (sel == 5 && (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))) {
 			// Battery Status: Left/Right cycle Off / Percent / Percent+Time / ALL (0..3), wrapping.
 			if (pressed & PSP_CTRL_LEFT)  g_show_battery = (g_show_battery > 0) ? g_show_battery - 1 : 3;
 			if (pressed & PSP_CTRL_RIGHT) g_show_battery = (g_show_battery < 3) ? g_show_battery + 1 : 0;
@@ -1173,11 +1908,32 @@ static void run_settings_menu(const char *gid)
 			}
 			changed = 1;
 			draw_settings(sel, gid);
+		} else if (sel == 6 && (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))) {
+			// Stop Charging (GLOBAL): Left/Right cycle OFF / 95 / 90 / 85 / 80 / 75 /
+			// 70 / ON, wrapping. While set, battery_charge_gate (sysstats.c) forbids
+			// charging at/above the threshold via scePowerBatteryForbidCharging and
+			// re-permits below it; ON (internal 100) forbids unconditionally. The poll
+			// thread picks the new value up on its next cycle, so no live apply is
+			// needed here.
+			static const int sc_steps[8] = { 0, 95, 90, 85, 80, 75, 70, 100 };
+			int sc = 0;   // 0=OFF, 1..6 = 95..70, 7=ON (internal 100)
+			if      (g_batt_stop_charge >= 100) sc = 7;
+			else if (g_batt_stop_charge >= 95) sc = 1;
+			else if (g_batt_stop_charge >= 90) sc = 2;
+			else if (g_batt_stop_charge >= 85) sc = 3;
+			else if (g_batt_stop_charge >= 80) sc = 4;
+			else if (g_batt_stop_charge >= 75) sc = 5;
+			else if (g_batt_stop_charge >= 70) sc = 6;
+			if (pressed & PSP_CTRL_LEFT)  sc = (sc > 0) ? sc - 1 : 7;
+			if (pressed & PSP_CTRL_RIGHT) sc = (sc < 7) ? sc + 1 : 0;
+			g_batt_stop_charge = sc_steps[sc];
+			if (g_batt_stop_charge > 0) battery_poll_ensure_started();   // gate needs the poll thread
+			changed = 1;   // global settings.cfg
+			draw_settings(sel, gid);
 		} else if (sel == 7 && (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))) {
 			// Overclock: Left/Right step the multiplier table (0 = stock 333MHz). Applied
 			// immediately, live — see oc_apply. Deliberately does NOT wrap (unlike the other
-			// settings): wrapping would let LEFT at stock jump straight to the top step and
-			// apply max clock live in one press, which is real hardware stress on a Phat.
+			// settings): wrapping would let LEFT at stock jump straight to the top step.
 			if ((pressed & PSP_CTRL_LEFT)  && g_overclock_id > 0)             g_overclock_id--;
 			if ((pressed & PSP_CTRL_RIGHT) && g_overclock_id < OC_STEPS - 1)  g_overclock_id++;
 			g_overclock_stable = 0;   // a newly picked step isn't vouched for -> confirm again next boot
@@ -1196,22 +1952,19 @@ static void run_settings_menu(const char *gid)
 			else { g_uart_log = 0; g_show_debug = mode; }
 			changed = 1;
 			draw_settings(sel, gid);
-		} else if (sel != 2 && sel != 6 && sel != 7 && sel != 8 && sel != 11 && (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))) {
-			// X REMOVED from this chain (per request): plain rows now change only on Left/Right,
-			// leaving X free as the "down/disable/decrease" key on the Overclock + Video Skip rows.
+		} else if (sel != 2 && sel != 3 && sel != 5 && sel != 6 && sel != 7 && sel != 8 && sel != 9 && sel != 10 && sel != 11 && (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))) {
+			// Excludes rows with their own L/R handling: 2 Show FPS, 3 Overlay Location,
+			// 5 Battery, 6 Stop Charging, 7 Overclock, 8 Debug, 9 Screen Tuning (Tri/X only),
+			// 10 FPS unlocks, 11 Frame Limit (hold-repeat). Plain rows change only on
+			// Left/Right; X is the "down/disable/decrease" key on the Overclock + Video
+			// Skip rows.
 			if      (sel == 1) { g_default_slot     = !g_default_slot;     changed  = 1; }   // global
-			else if (sel == 3) { g_fps_show_lows    = !g_fps_show_lows;    changed  = 1; }   // global
 			else if (sel == 4) {                                                             // global
-				g_show_ft_chart = !g_show_ft_chart;
-				if (g_show_ft_chart) fps_poll_ensure_started();
-				changed = 1;
-			}
-			else if (sel == 5) {                                                             // global
 				g_show_cpu_usage = !g_show_cpu_usage;
 				if (g_show_cpu_usage) fps_poll_ensure_started();
 				changed = 1;
 			}
-			else if (sel == 9)  {
+			else if (sel == 12)  {
 				// Intro Video Skip: Cycles OFF -> capture -> (learned, only once one exists) -> OFF.
 				// Takes effect on the game's NEXT boot (the watcher is started once from menu_thread
 				// at startup, so toggling here cannot affect this session).
@@ -1220,7 +1973,7 @@ static void run_settings_menu(const char *gid)
 				else                                    g_video_skip = VSKIP_OFF;
 				gchanged = 1;
 			}
-			else if (sel == 10) { g_autoload         = !g_autoload;         gchanged = 1; }   // per-game
+			else if (sel == 13) { g_autoload         = !g_autoload;         gchanged = 1; }   // per-game
 			draw_settings(sel, gid);
 		} else if (sel != osel) {
 			draw_settings(sel, gid);
@@ -1230,10 +1983,12 @@ static void run_settings_menu(const char *gid)
 	}
 	if (changed)  save_settings();            // global settings.cfg
 	if (gchanged) save_game_settings(gid);    // per-game gameset.cfg (for gid)
+	if (close_all) { game_frame_limit_load(); return 1; }   // straight out to the game (HUD)
 	// This screen loaded gid's per-game values, and gid may be a DIFFERENT game's
 	// folder than the one running (the browser can switch games) — so re-sync the
 	// live frame cap to the RUNNING game, or we'd pace it with another game's limit.
 	game_frame_limit_load();
+	return 0;
 }
 
 // ── Game/folder browser ──────────────────────────────────────
@@ -1395,22 +2150,71 @@ static u32 read_save_version(const char *path)
 }
 
 // ── Memory-Stick availability probe (menu open) ──
-// Running from MS, the game's "UMD" streaming executes the whole inferno ->
-// fatms -> msstor chain on the GAME'S OWN thread (PSP io drivers run in the
-// caller's context; ARK-4's inferno only creates a one-shot mount thread), so a
-// freeze can catch a game thread INSIDE the FAT driver holding its lock — the
-// browser's first MS call would then block on that lock forever (the historic
-// 1-in-10 frozen menu, MS LED blinking mid-transaction). Instead of predicting
-// that from thread wait-states (the old seconds-long stable-wait gate), test the
-// hazard directly AFTER freezing: open a file that always exists via
-// sceIoOpenAsync — the ASYNC IO THREAD blocks on the FAT lock, not us — and
-// poll it briefly. Completed = lock free (frozen threads can't take it anymore),
-// safe to browse. Still pending = a frozen thread holds it -> caller unfreezes
+// After freezing, test the MS hazard directly: open a file that always exists via
+// sceIoOpenAsync (the async IO thread blocks on the lock, not us) and poll it briefly.
+// Completed = lock free, safe to browse. Still pending = a frozen thread holds it ->
+// caller unfreezes.
 
 // The save browser: soft-freeze, enumerate, draw, navigate, and act (Square=save,
 // X=load, Triangle=delete; confirm for existing slots, none for a new save). A
 // save or load CLOSES the browser (on load, the system becomes the saved state and
 // resumes there — the menu does not reappear). L-trigger -> game/folder list.
+// POPS (PS1) doesn't repaint outside its game area, so blank the display buffer
+// black before the game resumes to avoid menu residue in the side bars.
+static void pops_clear_on_menu_close(void)
+{
+	if (!g_is_pops) return;
+	dbg_fill_rect(0, 0, 480, 272, 0xFF000000);
+}
+
+// ── One-time Welcome screen ────────────────────────────────────────────────
+// Shown the first time the menu opens (g_welcome_shown starts 0 and persists in
+// settings.cfg word [12] once the user presses X). Full-screen, same chrome as
+// the other menu pages. Tells the user it's beta, that not every game is verified
+// (esp. save/load), the recommended safe workflow, and where cheat.db goes.
+static void run_welcome_screen(void)
+{
+	static const struct exline b[] = {
+		EXB("Welcome to PSPFatSave v" VERSION_STRING "!"),
+		EXS(),
+		EXB("This is BETA software. Every feature here"),
+		EXB("was very hard to build on a closed system"),
+		EXB("like the PSP, so please expect rough edges."),
+		EXS(),
+		EXC("NOT every game has been tested -"),
+		EXC("especially saving and loading."),
+		EXC("Always be careful:"),
+		EXS(),
+		EXH("SAFE WORKFLOW"),
+		EXI("First test saving while in GAMEPLAY -"),
+		EXI("not in the menu or while loading."),
+		EXS(),
+		EXI("a) Also save with the game's OWN save"),
+		EXI("   feature, in between PSPFatSave saves."),
+		EXS(),
+		EXI("b) Test a NEW game in this order:"),
+		EXI("   1. Save"),
+		EXI("   2. Quit the game"),
+		EXI("   3. Load the game"),
+		EXI("   4. Load the save"),
+		EXS(),
+		EXH("CHEATS"),
+		EXI("If you want the FPS unlock feature,"),
+		EXI("place cheat.db into ms0:/seplugins/."),
+		EXS(),
+		EXB("Press X to continue."),
+	};
+	int i, n = (int)(sizeof(b)/sizeof(b[0]));
+	draw_screen_chrome("Welcome", "X: Continue");
+	for (i = 0; i < n; i++)
+		dbg_text(b[i].col, 3 + i, b[i].fg, BR_BG, b[i].t);
+	wait_button_edge(PSP_CTRL_CROSS);
+	wait_release(PSP_CTRL_CROSS);
+	g_welcome_shown = 1;                     // never show again
+	save_settings();                         // persist the flag (MS safe: probe passed)
+	if (DBG_UART()) uart_puts("[WELC] welcome shown, persisted");
+}
+
 void run_save_browser(void)
 {
 	char dir[80], path[128], cur_id[20];
@@ -1421,15 +2225,11 @@ void run_save_browser(void)
 	g_browser_opened = 0;                  // becomes 1 only if the freeze below succeeds and we open
 	g_menu_quiet = 1;                      // keep the paced CP checkpoints quiet during the browse
 	// Pause-only freeze + MS probe. The menu needs exactly two things: the game
-	// paused, and the MS usable from this thread. It does NOT need the save/load
-	// paths' quiescent freeze (no firmware suspend happens here), so use the FAST
-	// gate (first observed WAITING, or ~0.5s best-effort, then a dispatch-off
-	// suspend — safe for READY threads) instead of the old stable-wait gate that
-	// randomly cost 3-5s waiting for GTA's threadmain to show a steady wait.
-	// The one real hazard — freezing a game thread while it's inside the FAT
-	// driver holding its lock (see ms_probe_after_freeze above) — is now checked
-	// DIRECTLY after freezing; if the lock is held, unfreeze so the holder
-	// finishes (~ms) and retry. Deterministic, typically opens on the first try.
+	// paused, and the MS usable from this thread. Use the FAST gate (first observed
+	// WAITING, or ~0.5s best-effort, then a dispatch-off suspend — safe for READY
+	// threads). The MS-lock hazard is checked directly after freezing
+	// (ms_probe_after_freeze); if the lock is held, unfreeze so the holder finishes
+	// and retry.
 	{
 		int attempt, opened = 0;
 		gatelog_reset();                                 // buffered [PRE]/[SUS] from this open only
@@ -1460,6 +2260,10 @@ void run_save_browser(void)
 	g_menu_quiet = 0;
 	sceIoMkdir("ms0:/seplugins/SAVESTATE", 0777);
 	dbg_init();                            // grab the currently-displayed framebuffer
+
+	// One-time beta welcome: show on the very first menu open (game frozen here,
+	// MS usable). Persists via settings.cfg after X, so it never appears again.
+	if (!g_welcome_shown) run_welcome_screen();
 
 	// Start at the running game's folder (or "globalstate" if none).
 	strncpy(cur_id, umdid[0] ? umdid : "globalstate", 19); cur_id[19] = '\0';
@@ -1504,6 +2308,7 @@ void run_save_browser(void)
 		if (pressed & (PSP_CTRL_CIRCLE | PSP_CTRL_NOTE)) {   // close (O or NOTE)
 			wait_buttons_up();             // don't leak the close press into the game
 			arm_input_suppress();          // ...nor any backlog sampled while the menu was up
+			pops_clear_on_menu_close();    // POPS won't repaint the side bars
 			resume_game_threads();
 			return;
 		}
@@ -1538,7 +2343,17 @@ void run_save_browser(void)
 
 		// ── SETTINGS (R-trigger) ── plugin settings sub-menu; L/O return to saves.
 		if (pressed & PSP_CTRL_RTRIGGER) {
-			run_settings_menu(cur_id);
+			if (run_settings_menu(cur_id)) {         // gamma HUD: close everything, game keeps running
+				// Exit-path UART checkpoints (see the [STX] note in run_settings_menu).
+				if (DBG_UART()) uart_puts("[STX] exit: settings closed (hud)");
+				wait_buttons_up();                   // don't leak the close press into the game
+				if (DBG_UART()) uart_puts("[STX] exit: buttons up");
+				arm_input_suppress();                // ...nor any backlog sampled while the menu was up
+				pops_clear_on_menu_close();          // POPS won't repaint the side bars
+				resume_game_threads();
+				if (DBG_UART()) uart_puts("[STX] exit: game threads resumed");
+				return;
+			}
 			draw_browser(sel, top, cur_id);          // restore the browser
 			kpeek(&pad); prev = pad.Buttons;
 			continue;
@@ -1557,10 +2372,7 @@ void run_save_browser(void)
 				continue;
 			}
 			if (free_kernel_ram_kb() < LOW_RAM_SAVE_LOAD_KB) {
-				// Observed (user report): free kernel RAM dropping to ~35KB caused a
-				// crash during save/load - the freeze + compression/decompression work
-				// needs real headroom. 50KB is a safety margin above that observed
-				// failure point, not a value derived from a known hard requirement.
+				// Free kernel RAM too low to attempt a save.
 				info_msg_red("Save disabled", "Free RAM too low", msg_box_y(sel, top));
 				draw_browser(sel, top, cur_id);
 				kpeek(&pad); prev = pad.Buttons;
@@ -1584,24 +2396,19 @@ void run_save_browser(void)
 				go = 0;
 			}
 			if (go) {
-				// Close the menu FIRST: resume so the game redraws a clean frame,
-				// then save (FreezeSave re-freezes). Clears g_menu_open before the
-				// snapshot so a loaded save isn't stuck "open".
-				// Wait for the trigger/confirm X to be RELEASED before resuming — the
-				// game runs ~0.8s (the 100ms redraw + FreezeSave's freeze latency) with
-				// a still-held X as real game input, and that reaction gets captured
-				// INTO the savestate (the "button leak through save": every load replays
-				// it). Game still frozen here, so the wait is safe (as the O-close path).
+				// Close the menu FIRST: resume so the game redraws a clean frame, then
+				// save (FreezeSave re-freezes). Clears g_menu_open before the snapshot.
+				// Wait for the trigger/confirm X to be RELEASED before resuming so the
+				// still-held button isn't captured into the savestate.
 				wait_buttons_up();
-				// Suppress+drain BOTH input paths across the ~100ms window the game runs
-				// before FreezeSave re-freezes it — latch-reading games (Ratchet & Clank)
-				// and buffer-backlog games (Tomb Raider Legends) would otherwise see the
-				// menu's stale press and act on it. Force BOTH back to 0 BEFORE FreezeSave
-				// so the mode-9 snapshot never captures a nonzero value: a captured
-				// g_suppress_latch=1 would restore into a loaded session and mute its latch
-				// forever; a captured g_suppress_posbuf_calls>0 would spend its remaining
-				// count suppressing unrelated future input right after that load.
+				// Suppress+drain BOTH input paths across the window the game runs before
+				// FreezeSave re-freezes it, and force both back to 0 so the snapshot never
+				// captures a nonzero value.
 				arm_input_suppress();
+				// Hold the gamma correction OFF for the whole save (g_st_op_hold). It is
+				// cleared when the game threads resume after the save or on an abort, and
+				// captured =1 so a later LOAD stays held until its resumed tail clears it.
+				g_st_op_hold = 1;
 				g_menu_open = 0;
 				resume_game_threads();
 				sceKernelDelayThread(100000);        // ~100ms: let the game redraw (both paths drain here)
@@ -1619,9 +2426,7 @@ void run_save_browser(void)
 		if (pressed & PSP_CTRL_SQUARE) {
 			if (load_only) {
 				// Browsing a DIFFERENT game's folder than the one running: loading here is
-				// disabled — a cross-game load would resume another game's kernel/session
-				// over the running one. Same red notice as the disabled Save above; any key
-				// dismisses. (Deleting/browsing other games' folders is still allowed.)
+				// disabled. Same red notice as the disabled Save above; any key dismisses.
 				info_msg_red("Loading disabled", "Different game", msg_box_y(sel, top));
 				draw_browser(sel, top, cur_id);
 				kpeek(&pad); prev = pad.Buttons;
@@ -1637,9 +2442,8 @@ void run_save_browser(void)
 			if (sel >= g_show_newsave && g_row_count > 0) {
 				int go;
 				sprintf(path, "%s/%s", dir, g_rows[sel - g_show_newsave].name);
-				// A load resumes the SAVE's own kernel/plugin build. If that build
-				// differs from the running one, the resumed plugin (hook, menu
-				// thread, layout) can misbehave — warn and require confirmation.
+				// A load resumes the SAVE's own kernel/plugin build; if it differs from the
+				// running one, warn and require confirmation.
 				{
 					u32 sv = read_save_version(path);
 					if (sv != SAVESTATE_VERSION)
@@ -1654,6 +2458,7 @@ void run_save_browser(void)
 					// don't let the game twitch on the way out.)
 					wait_buttons_up();
 					arm_input_suppress();
+					g_st_op_hold = 1;                // hold gamma off through the load (see SAVE trigger)
 					g_menu_open = 0;
 					resume_game_threads();           // close the menu first
 					FreezeLoad(path);                // own freeze; reconstructs save-time state
@@ -1703,7 +2508,7 @@ int menu_thread(SceSize args, void *argp)
 	int oc_confirm_needed;
 	(void)args; (void)argp;
 	dbg_init();
-	load_settings();   // restore Show-Debug / Default-Slot / Overclock (defaults if no file)
+	load_settings();   // restore settings (defaults if no file or another generation's magic)
 	oc_init();          // safe stock baseline now; a persisted non-stock step (if any) is
 	                    // confirmed + applied on first wake below, once the game's display
 	                    // is actually up (see boot_frozen_prompts — nothing is on screen yet here)
@@ -1729,6 +2534,16 @@ int menu_thread(SceSize args, void *argp)
 			// frame rather than only after the settings screen is opened.
 			game_frame_limit_load();
 			if (DBG_UART()) { char b[64]; sprintf(b, "[FLIMIT] boot: %d fps (0=off)", g_frame_limit); uart_puts(b); }
+			// Per-game gamma too: read here (menu thread = MS safe, umdid known),
+			// so the pass starts with THIS game's value from the first frame — the
+			// earlier menu_thread read ran before umdid existed and always defaulted.
+			st_load_game_gamma();
+			if (DBG_UART()) { char b[48]; sprintf(b, "[ST] gam boot: %d.%02d", g_st_gamma / 100, g_st_gamma % 100); uart_puts(b); }
+			// Per-game FPS unlock: stream the DB for this game's FPS cheats + the saved
+			// selection (MS-safe here), and start the apply thread if one is active.
+			cheats_load_for_game();
+			st_prealloc();   // reserve the GE buffers now (Colin McRae: mid-game enable found the heap full)
+			if (st_active()) st_ensure_started();   // a non-neutral loaded gamma starts the pass
 			// Same deal for the per-game Intro Video Skip: read here (menu thread = MS
 			// safe), then hand the 30s window to its own thread so it can poll for the
 			// game to load its psmf module without holding up the auto-open below.
@@ -1795,6 +2610,11 @@ int menu_thread(SceSize args, void *argp)
 		run_save_browser();
 		if (g_set_home_popup) g_set_home_popup(1);   // re-enable HOME on close
 		g_menu_open = 0;                 // NOTE already released; just re-arm
+		// Final [STX] step. The worker's stats line reads all-zero while
+		// g_menu_open is 1 (the poll block is skipped and the game is frozen, so
+		// no GE submits reach the hook), which is how a stall before this point
+		// shows up in the log even without a crash.
+		if (DBG_UART()) uart_puts("[STX] exit: menu closed, g_menu_open=0");
 	}
 
 	return 0;

@@ -9,7 +9,6 @@
 #define BR_ROW_H       10    // char-rows per entry (80px)
 #define BR_VISIBLE     3     // entries on screen at once
 
-// Auto-generated public interface for menu.c (review/trim).
 void boot_frozen_prompts(int do_oc, int do_arm);
 int confirm(const char *msg, int by);
 void draw_settings(int sel, const char *gid);
@@ -19,6 +18,9 @@ void load_settings(void);
 void ram_usage_kb(u32 *static_kb, u32 *dynamic_kb, u32 *free_kb);
 void run_save_browser(void);
 void save_game_settings(const char *gid);
+void save_settings(void);   // global settings.cfg; also called by the screen-tuning worker (HUD edits)
 void suppress_posbuf_slots(SceCtrlData *pad_data, int count, int res, u32 clean_value);
+// Live screen-tuning HUD (see g_st_hud in pspfatsave.h).
+void st_hud_draw(void *topaddr, int bufw, int pfmt);   // banner over the running game
 
 #endif

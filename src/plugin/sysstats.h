@@ -7,7 +7,6 @@
 #define BATTERY_POLL_STACK_BYTES 3072
 #define FPS_POLL_STACK_BYTES     2048
 
-// Auto-generated public interface for sysstats.c (review/trim).
 int battery_draw(int y);
 void battery_poll_ensure_started(void);
 int battery_poll_thread(SceSize args, void *argp);
@@ -19,6 +18,7 @@ void fps_draw(void *topaddr, int bufferwidth, int pixelformat);
 void fps_poll_ensure_started(void);
 int fps_poll_thread(SceSize args, void *argp);
 void fps_tick(u32 now);
+int fps_wait_vblank_real(void);   // real sceDisplayWaitVblankStart (not the patched syscall)
 u32 fps_window_us(void);
 void frame_limit_ge(void);
 u32 frame_limit_target_us(int fps);

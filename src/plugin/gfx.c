@@ -142,14 +142,10 @@ u32 from565(u16 c) {
 	u32 b = (u32)((c >> 11) & 0x1F) << 3;
 	return 0xFF000000u | (b << 16) | (g << 8) | r;
 }
-// Convert the two OTHER 16-bit PSP display formats to 565. All three are ABGR (R in
-// the low bits — see pspsdk scr_printf.c convert_8888_to_5551/565 + gu/doc/commands.txt):
+// Convert 5551/4444 to 565. All three are ABGR (R in the low bits):
 //   565  = B5 G6 R5 : R@0, G@5(6b), B@11(5b)
 //   5551 = A1 B5 G5 R5 : R@0, G@5(5b), B@10(5b)   -> expand G 5->6 bits
 //   4444 = A4 B4 G4 R4 : R@0, G@4, B@8            -> expand R/B 4->5, G 4->6
-// Thumbnails/screenshots are stored 565, so a 5551/4444 source MUST be converted or its
-// colors come out wrong (the "other games' thumbnails look off" bug — those games render
-// in 5551/4444). Bit-replicate on expansion so full-scale stays full-scale.
 u16 c5551_to565(u16 c) {
 	u32 r = c & 0x1F, g = (c >> 5) & 0x1F, b = (c >> 10) & 0x1F;
 	g = (g << 1) | (g >> 4);                       // 5 -> 6 bits
@@ -162,8 +158,7 @@ u16 c4444_to565(u16 c) {
 	b = (b << 1) | (b >> 3);                       // 4 -> 5 bits
 	return (u16)(r | (g << 5) | (b << 11));
 }
-// Pack 32-bit AABBGGRR -> the other two 16-bit formats (exact layouts from pspsdk
-// scr_printf.c convert_8888_to_5551 / _4444; our color word is ABGR, R low, matching).
+// Pack 32-bit AABBGGRR -> 5551.
 static u16 to5551(u32 c) {
 	u32 a = (c >> 24) ? 0x8000u : 0u;
 	return (u16)(a | ((c >> 3) & 0x1F) | (((c >> 11) & 0x1F) << 5) | (((c >> 19) & 0x1F) << 10));
@@ -171,11 +166,7 @@ static u16 to5551(u32 c) {
 static u16 to4444(u32 c) {
 	return (u16)((((c >> 28) & 0xF) << 12) | ((c >> 4) & 0xF) | (((c >> 12) & 0xF) << 4) | (((c >> 20) & 0xF) << 8));
 }
-// Pack an AABBGGRR color into a given 16-bit display format (for our solid-color UI:
-// text glyphs, fills). Every 16-bit draw MUST use this, not a bare to565() — writing a
-// 565 value into a 5551/4444 framebuffer garbles the color (the "same game screenshot
-// wrong" regression: previews are stored true-565 now, but a 5551/4444 game's display
-// needs them repacked to ITS format).
+// Pack an AABBGGRR color into a given 16-bit display format.
 u16 pack16_fmt(u32 c, int pfmt) {
 	if (pfmt == PSP_DISPLAY_PIXEL_FORMAT_5551) return to5551(c);
 	if (pfmt == PSP_DISPLAY_PIXEL_FORMAT_4444) return to4444(c);
@@ -195,9 +186,7 @@ void dbg_putchar(char ch)
 	const u8 *glyph;
 	int ci = (unsigned char)ch;
 
-	// Hard backstop: never draw outside the captured framebuffer, regardless of what
-	// row/col a caller computed — same overflow class v547 fixed for the panel fill
-	// (a distant constant change silently pushed a row/col past the buffer edge).
+	// Never draw outside the captured framebuffer.
 	if (dbg_row < 0 || dbg_col < 0) return;
 	if (dbg_row * 8 + 8 > 272) return;
 	if (dbg_col * 8 + 8 > dbg_bufw) return;
@@ -263,19 +252,13 @@ struct dbg_fb_info {
 static struct dbg_fb_info dbg_bufs[2];
 int dbg_buf_count;
 
-// Display framebuffer captured (raw addr, before any cache-alias) for re-asserting the
-// screen after a game blanks it: GTA disables the display in its SUSPENDING handler (see
-// cooperative_volmem_release), so our overlay/prompt would otherwise draw to an off-screen
-// buffer. The display driver is a kernel thread (not frozen), so re-pointing it mid-freeze
-// is safe.
+// Display framebuffer captured (raw addr) for re-asserting the screen.
 static void *g_disp_addr = NULL;
 static int   g_disp_bufw = 0, g_disp_pfmt = 0;
 
 void reassert_display(void)
 {
-	// NEXTFRAME (vsync), not IMMEDIATE — sceDisplaySetFrameBuf rejects IMMEDIATE here with
-	// SCE_DISPLAY_ERROR_ARGUMENT. k1=0 so the framebuffer-address validation passes (as the
-	// ctrl peek does). The captured addr/bufw/pfmt are the game's own (valid) values.
+	// Use NEXTFRAME (vsync), not IMMEDIATE, for the frame-buffer set.
 	if (g_disp_addr) {
 		int k1 = pspSdkSetK1(0);
 		sceDisplaySetFrameBuf(g_disp_addr, g_disp_bufw, g_disp_pfmt, PSP_DISPLAY_SETBUF_NEXTFRAME);
@@ -283,21 +266,8 @@ void reassert_display(void)
 	}
 }
 
-// Post-freeze: pin the display to the buffer ACTUALLY on screen right now and adopt
-// its exact geometry as our single draw target. Used for games that do NOT blank in a
-// power callback (g_game_pcb_count == 0). Their pre-freeze capture in
-// dbg_capture_both_bufs() can be STALE: the game keeps flipping between that capture
-// and the freeze — possibly to a THIRD framebuffer we never captured (triple buffering)
-// or with a stride the display controller uses that no longer matches. That showed up
-// as the save/load banner landing on an off-screen buffer (no banner at all) or at a
-// mismatched stride (the ~50% horizontal shift), intermittently and game-dependent
-// (e.g. Pirates). Reading GetFrameBuf(IMMEDIATE) AFTER the freeze — game stopped, front
-// buffer stable — gives the true current buffer + width/format; we draw ONLY to it and
-// SetFrameBuf it back so the controller's stride matches our draw stride. Blanking games
-// (pcb>0) still use reassert_display() with their pre-blank capture (a post-freeze
-// GetFrameBuf there would return the game's blanked buffer). Register/​syscall-safe here:
-// the display driver is a kernel thread (not frozen). k1=0 so the address validation
-// passes, exactly like reassert_display().
+// Post-freeze: pin the display to the buffer currently on screen and adopt its
+// geometry as our single draw target.
 void pin_current_display(void)
 {
 	void *addr = NULL; int bufw = 0, pfmt = 0;
@@ -354,15 +324,13 @@ void dbg_capture_both_bufs(void)
 		// fallback to single-buffer mode
 		dbg_init();
 		// Assign fields individually — do NOT type-pun &dbg_fb as a struct (the three
-		// globals aren't guaranteed to be laid out like dbg_fb_info). Mirrors :375.
+		// globals aren't guaranteed to be laid out like dbg_fb_info).
 		dbg_bufs[0].fb   = dbg_fb;
 		dbg_bufs[0].bufw = dbg_bufw;
 		dbg_bufs[0].pfmt = dbg_pfmt;
 		dbg_buf_count = 1;
 	}
 #if DEBUG_BUILD
-	// Pre-freeze geometry, for comparison with the post-freeze [FBPIN] line: a mismatch
-	// (different bufw/pfmt, or a third front buffer) is the banner-shift / no-banner cause.
 	if (DBG_UART()) {
 		int b;
 		uart_log_hex("[FBCAP] count=", (u32)dbg_buf_count);
@@ -373,6 +341,15 @@ void dbg_capture_both_bufs(void)
 		}
 	}
 #endif
+}
+
+// Primary captured framebuffer for the save UI (set by dbg_capture_both_bufs /
+// pin_current_display). .fb is already a KSEG1 address. Returns 0 if not captured.
+int dbg_capture_buf(void **fb, int *bufw, int *pfmt)
+{
+	if (dbg_buf_count <= 0 || !dbg_bufs[0].fb || dbg_bufs[0].bufw <= 0) return 0;
+	*fb = dbg_bufs[0].fb; *bufw = dbg_bufs[0].bufw; *pfmt = dbg_bufs[0].pfmt;
+	return 1;
 }
 
 // Write text to all captured buffers at the current global dbg position
@@ -390,33 +367,7 @@ void dbg_print_all(const char *str)
 	dbg_bufw = saved.bufw;
 	dbg_pfmt = saved.pfmt;
 }
-// Fill a band SOLID with an AABBGGRR color across every captured framebuffer.
-void dbg_fill_band_color(int row0, int nrows, u32 color)
-{
-	int b, y, x;
-	int y0 = row0 * 8, y1 = (row0 + nrows) * 8 + PANEL_EXTRA_PX;   // +extra px past the row grid (see PANEL_EXTRA_PX)
-	// CLAMP to the 272-row display: with PANEL_TOP=15, PANEL_H=18, PANEL_EXTRA_PX=10 the
-	// band bottom is (15+18)*8+10 = 274 — 2 rows PAST the framebuffer. Those out-of-bounds
-	// writes clobber ~2-4KB of VRAM just past the game's framebuffer (its other buffer /
-	// textures / GE data) on every save, faulting the game seconds later when it renders —
-	// THE per-attempt-random GTA-after-save freeze. v481 fit (266); v482 grew the panel and
-	// started overflowing (274). (Row grid stays intact; only the extra pad is trimmed.)
-	if (y1 > 272) y1 = 272;
-	for (b = 0; b < dbg_buf_count; b++) {
-		int w = dbg_bufs[b].bufw;
-		if (dbg_bufs[b].pfmt == PSP_DISPLAY_PIXEL_FORMAT_8888) {
-			volatile u32 *fb = (volatile u32 *)dbg_bufs[b].fb;
-			for (y = y0; y < y1; y++) for (x = 0; x < 480; x++) fb[y * w + x] = color;
-		} else {
-			u16 c16 = pack16_fmt(color, dbg_bufs[b].pfmt);   // per-buffer format (565/5551/4444)
-			volatile u16 *fb = (volatile u16 *)dbg_bufs[b].fb;
-			for (y = y0; y < y1; y++) for (x = 0; x < 480; x++) fb[y * w + x] = c16;
-		}
-	}
-}
-// Fill a pixel rectangle across EVERY captured framebuffer (the pre-/post-suspend-safe
-// path, same buffer set dbg_print_all / dbg_fill_band_color use). For banner chrome —
-// progress bars, prompt pills — that must land on whichever buffer is actually on screen.
+// Fill a pixel rectangle across every captured framebuffer.
 void dbg_fill_rect_all(int px, int py, int w, int h, u32 color)
 {
 	int i;

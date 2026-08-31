@@ -46,7 +46,17 @@ If you enjoy this project and want to support its development, you can buy me a 
   - **Percent:** Battery % only
   - **Percent+Time:** % + estimated remaining discharge/charge time
   - **ALL:** Extra telemetry (voltage, current, temperature, capacity, cycle count)
-- Charge state indicator (↑ charging / ↓ discharging arrow)
+- Charge state indicator (↑ charging / ↓ discharging arrow), driven by the battery's real measured current
+- Real Capacity Override: enter your battery's actual mAh (useful for aftermarket/replacement cells) so the % and time estimates are accurate
+- Stop Charging: cap charging at 95/90/85/80/75/70%, or disable charging entirely (runs off USB/AC power) - both help long-term battery health
+
+**Screen Tuning** (optional, per-game)
+- Live brightness/gamma adjustment (0.50x-2.00x) and color temperature (warm/cool), fixes a too-dark screen or a color cast on games that render too dark, too bright, or with an off color balance
+- Full-screen test pattern plus a live on-screen adjustment HUD to dial it in while playing
+
+**FPS Unlocks** (optional, per-game)
+- Applies FPS-unlock cheat codes from a `cheat.db`/CWCheat database to raise a game's frame-rate cap above its normal limit, for games that support it
+- Automatically lists the available unlock options for whichever game is running
 
 **Per-Game Settings**
 - Intro Video Skip (OFF / learn mode / timed playback)
@@ -55,7 +65,12 @@ If you enjoy this project and want to support its development, you can buy me a 
 
 **System Settings** (global, all games)
 - Overclock (PSP-1000 only; raw PLL registers, 0 = stock 333MHz)
+- Overlay Location: choose which screen corner the FPS/battery/CPU overlay appears in
 - Debug Messages (UART logging + on-screen markers, debug build only)
+
+**Onboarding**
+- One-time welcome screen on first use covering the safe save/load workflow
+- Press R on any Settings row for a full explanation of what that setting does
 
 ![PSPFatSave Screenshot](https://raw.githubusercontent.com/Grunwalskii/PSPFatSave-Public/main/Screens.png)
 
@@ -108,6 +123,8 @@ make DEBUG_BUILD=0
 ```
 
 Produces `pspfatsave.prx`. Copy it to `ms0:/seplugins/` and enable it in your plugins config. (GAME only - "game, pspfatsave.prx, on")
+
+For the FPS Unlocks feature, place a CWCheat-format `cheat.db` in `ms0:/seplugins/` too (a copy is included in each release's zip).
 
 ## Credits
 

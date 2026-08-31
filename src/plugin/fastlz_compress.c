@@ -74,9 +74,6 @@
 #endif
 #endif
 
-/*
- * FIXME: use preprocessor magic to set this on different platforms!
- */
 typedef unsigned char  flzuint8;
 typedef unsigned short flzuint16;
 typedef unsigned int   flzuint32;
@@ -96,7 +93,6 @@ int fastlz_decompress(const void* input, int length, void* output, int maxout);
 #define FASTLZ_READU16(p) ((p)[0] | (p)[1]<<8)
 #endif
 
-// HASH_LOG=11: fits 8KB hash table in 16KB L1 cache (vs FastLZ default 13=32KB, cache-thrashing).
 #define HASH_LOG  11
 #define HASH_SIZE (1<< HASH_LOG)
 #define HASH_MASK  (HASH_SIZE-1)
@@ -116,7 +112,7 @@ static FASTLZ_INLINE int FASTLZ_COMPRESSOR(const void* input, int length, void* 
 static FASTLZ_INLINE int FASTLZ_DECOMPRESSOR(const void* input, int length, void* output, int maxout);
 #include "fastlz_compress.c"
 
-// Level 2 compressor not built (only level 1 used); saves ~1KB.
+// Level 2 compressor not built (only level 1 used).
 int fastlz_compress_level(int level, const void* input, int length, void* output)
 {
   (void)level;   /* only level 1 is built */
