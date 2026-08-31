@@ -124,7 +124,7 @@ make
 make DEBUG_BUILD=0
 ```
 
-Produces `pspfatsave.prx`. Copy it to `ms0:/seplugins/` and enable it in your plugins config. (GAME only - "game, pspfatsave.prx, on")
+Produces `pspfatsave.prx`. Copy it to `ms0:/seplugins/` and enable it in your plugins config. (GAME and POPS - "game pops, pspfatsave.prx, on")
 
 For the FPS Unlocks feature, place a CWCheat-format `cheat.db` in `ms0:/seplugins/` too (a copy is included in each release's zip, sourced from [CWCheat-Database-Plus-](https://github.com/Saramagrean/CWCheat-Database-Plus-)).
 
