@@ -51,7 +51,7 @@ If you enjoy this project and want to support its development, you can buy me a 
 - Stop Charging: cap charging at 95/90/85/80/75/70%, or disable charging entirely (runs off USB/AC power) - both help long-term battery health
 
 **Screen Tuning** (optional, per-game)
-- Live brightness/gamma adjustment (0.50x-2.00x) and color temperature (warm/cool), fixes a too-dark screen or a color cast on games that render too dark, too bright, or with an off color balance
+- Mainly aimed at aftermarket screen mods (e.g. IPS) whose brightness/color response differs from the original PSP LCD - live gamma adjustment (0.50x-2.00x) and color temperature (warm/cool) correct a too-dark screen or a color cast
 - Full-screen test pattern plus a live on-screen adjustment HUD to dial it in while playing
 
 **FPS Unlocks** (optional, per-game)
