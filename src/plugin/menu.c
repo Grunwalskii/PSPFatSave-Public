@@ -8,6 +8,7 @@
 #include "fatsave.h"
 #include "screen_tuning.h"
 #include "cheats.h"
+#include "corevolt.h"
 
 // Set when the menu is opened by the boot auto-open (vs a NOTE tap): the browser then starts
 // on the newest save (for a quick load) regardless of the Default Slot setting. One-shot.
@@ -692,7 +693,9 @@ static int confirm_version_load(u32 save_ver, u32 plug_ver, int by)
 // shows any of: the overclock-confirm prompt, then the CAPTURE arm gate — then resumes ONCE.
 // A single continuous freeze keeps the game from advancing a frame between the two prompts.
 //   do_oc  : a non-stock overclock step is persisted -> ask X/O before applying it.
-//            Declining resets g_overclock_id to 0 and persists it.
+//            Declining resets g_overclock_id to 0 and persists it. A persisted
+//            core-voltage step rides the SAME answer: named in the prompt, applied
+//            just before the clock on accept, cleared on decline.
 //   do_arm : Video Skip = CAPTURE -> show "Hold RIGHT until Intro skipped" and wait for the
 //            user to hold D-pad Right for 1s. The game then resumes with Right ALREADY held,
 //            so the capture fires from the intro's first frame under the user's control.
@@ -729,10 +732,16 @@ void boot_frozen_prompts(int do_oc, int do_arm)
 
 	if (do_oc) {
 		int mhz10 = g_oc_freq_x10[g_overclock_id];
-		char l1[48];
+		char l1[64], vs[12];
 		const char *l2 = "X = Yes       O = No (stays at stock)";
 		u32 hit;
-		sprintf(l1, "Apply Overclock %d.%dMHz?", mhz10 / 10, mhz10 % 10);
+		// The core-voltage step is named in the prompt and answered by the SAME X/O:
+		// it exists only to hold up the overclock, so the two are one decision.
+		cv_short_str(vs);
+		if (g_corevolt_level >= 0)
+			sprintf(l1, "Apply Overclock %d.%dMHz  %s?", mhz10 / 10, mhz10 % 10, vs);
+		else
+			sprintf(l1, "Apply Overclock %d.%dMHz?", mhz10 / 10, mhz10 % 10);
 		dbg_fill_rect(0, 0, 480, 272, BR_BG);
 		dbg_text((60 - (int)strlen(l1)) / 2, 15, BR_WHITE, BR_BG, l1);
 		dbg_text((60 - (int)strlen(l2)) / 2, 17, BR_GREY,  BR_BG, l2);
@@ -741,13 +750,14 @@ void boot_frozen_prompts(int do_oc, int do_arm)
 		// from before entry would never edge and the prompt would look like it "ignores"
 		// input until released — clear it first so the next real press is a fresh edge.
 		wait_release(PSP_CTRL_CROSS | PSP_CTRL_CIRCLE);
-		if (DBG_UART()) uart_puts("[OC] confirm shown - X=apply O=stock");
 		hit = wait_button_edge(PSP_CTRL_CROSS | PSP_CTRL_CIRCLE);
-		if (DBG_UART()) { char b[40]; sprintf(b, "[OC] confirm hit=%08X", (unsigned)hit); uart_puts(b); }
 		if (hit & PSP_CTRL_CROSS) {
+			if (g_corevolt_level >= 0) cv_apply(g_corevolt_level);   // volts up BEFORE the clock
 			oc_apply(g_overclock_id);
 		} else {
 			g_overclock_id = 0;
+			g_corevolt_level = CV_LEVEL_NONE;
+			cv_revert();          // no-op unless something already moved the rail
 			save_settings();
 		}
 		// Clear the answer press before moving on (the arm gate reads a DIFFERENT button,
@@ -804,7 +814,8 @@ void boot_frozen_prompts(int do_oc, int do_arm)
 // [9]=overlay location (0=Up Left 1=Up Right 2=Down Left 3=Down Right; older
 // files wrote 0 here, so no generation bump was needed), [10]=Overclock stable
 // flag, [11]=real battery capacity mAh (0 = stock/BMS), [12]=free slot,
-// [13]=Stop-Charging threshold % (0=OFF, else 80..95).
+// [13]=Stop-Charging threshold % (0=OFF, else 80..95), [14]=core-voltage step
+// offset from stock (signed; 0=stock, >0 = more volts, <0 = less — see corevolt.c).
 //
 // The magic IS the settings generation; a file whose magic/size doesn't match the current
 // build is rejected wholesale (defaults load, and the file is rewritten with the current
@@ -812,16 +823,16 @@ void boot_frozen_prompts(int do_oc, int do_arm)
 // Per-game settings (Auto-Open, Intro Video Skip, Frame Limit, Save Compression)
 // stored in gameset.cfg; gamma in screen.cfg.
 #define SETTINGS_PATH  "ms0:/seplugins/SAVESTATE/settings.cfg"
-#define SETTINGS_MAGIC 0x53455443u   // "SETC" — settings generation; bump the letter on any layout change
+#define SETTINGS_MAGIC 0x53455448u   // "SETH" — settings generation; bump the letter on any layout change
 
 void load_settings(void)
 {
-	SceUID fd; u32 buf[14]; int n;
+	SceUID fd; u32 buf[16]; int n;
 	fd = sceIoOpen(SETTINGS_PATH, PSP_O_RDONLY, 0);
 	if (fd < 0) return;                          // no file -> keep defaults, nothing to adopt
 	n = sceIoRead(fd, buf, sizeof(buf));
 	sceIoClose(fd);                              // close BEFORE any rewrite (load may re-save)
-	// Strict: right magic AND full 14 words, else the file is another
+	// Strict: right magic AND full 16 words, else the file is another
 	// generation (see the generation scheme above) or corrupt — defaults load.
 	if (n == (int)sizeof(buf) && buf[0] == SETTINGS_MAGIC) {
 		g_show_debug   = (int)buf[1];            // debug routing 0..3 (see g_show_debug)
@@ -851,6 +862,12 @@ void load_settings(void)
 		if (g_batt_stop_charge != 0 && g_batt_stop_charge != 100 &&
 		    (g_batt_stop_charge < 70 || g_batt_stop_charge > 95))
 			g_batt_stop_charge = 0;
+		g_corevolt_level = (int)buf[14];     // ABSOLUTE core-voltage level (see corevolt.h)
+		// CV_LEVEL_NONE (-1) = leave the rail at stock; 0..CV_LEVEL_MAX is a real
+		// level. Anything else is a foreign generation or corruption.
+		if (g_corevolt_level < CV_LEVEL_NONE || g_corevolt_level > CV_LEVEL_MAX)
+			g_corevolt_level = CV_LEVEL_NONE;
+		cv_rail_defaults_load(buf[15]);      // cv_probe re-applies it at plugin start
 	} else if (n > 0) {
 		// Old generation or corrupt: NO migration — keep defaults and rewrite the
 		// file with this build's magic so the reset is visible once, not every boot.
@@ -865,7 +882,7 @@ void load_settings(void)
 // separately through st_save_game_gamma() (screen.cfg) — they no longer ride here.
 void save_settings(void)
 {
-	SceUID fd; u32 buf[14];
+	SceUID fd; u32 buf[16];
 	buf[0] = SETTINGS_MAGIC; buf[1] = (u32)g_show_debug;
 	buf[2] = (u32)g_default_slot; buf[3] = (u32)g_overclock_id;
 	buf[4] = (u32)g_uart_log; buf[5] = (u32)g_show_fps_overlay;
@@ -875,6 +892,8 @@ void save_settings(void)
 	buf[11] = (u32)g_batt_real_mah;   // real battery capacity mAh (0 = stock)
 	buf[12] = (u32)g_welcome_shown;   // one-time Welcome screen seen flag (0 -> show once)
 	buf[13] = (u32)g_batt_stop_charge;   // Stop-Charging threshold % (0=OFF, else 80..95)
+	buf[14] = (u32)g_corevolt_level;     // ABSOLUTE core-voltage level, -1 = stock
+	buf[15] = cv_rail_defaults_get();    // packed DDR+unknown-rail baseline (bit31 = valid)
 	sceIoMkdir("ms0:/seplugins/SAVESTATE", 0777);
 	fd = sceIoOpen(SETTINGS_PATH, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
 	if (fd >= 0) { sceIoWrite(fd, buf, sizeof(buf)); sceIoClose(fd); }
@@ -1087,14 +1106,19 @@ void draw_settings(int sel, const char *gid)
 		else
 			sprintf(val, "%d MHz", mhz10 / 10);
 	}
-	// Stable (Triangle-marked, non-stock only): RED with a "(Set as Stable)" tag, and the boot
-	// confirm is skipped. Otherwise the normal white row (message shown on game start).
-	if (g_overclock_stable && g_overclock_id > 0) {
-		sprintf(line, "%-20s< %s >  (Set as Stable)", "Overclock:", val);
-		draw_settings_row_col(r7, sel == 7, line, BR_RED);
-	} else {
-		settings_line(line, "Overclock:", val);
-		draw_settings_row(r7, sel == 7, line);
+	// This row does what it always did — Left/Right pick the CPU frequency and
+	// Triangle marks a step Stable — so the ordinary case needs nothing new. X opens
+	// the Overclock page, where the bus and the voltage rails live; none of that
+	// is reachable from here, which is the point: the rails are for tinkering, the
+	// clock is not.
+	{
+		if (g_overclock_stable && g_overclock_id > 0) {
+			sprintf(line, "%-20s< %s >  X:adv  STABLE", "Overclock:", val);
+			draw_settings_row_col(r7, sel == 7, line, BR_RED);
+		} else {
+			sprintf(line, "%-20s< %s >  X:adv", "Overclock:", val);
+			draw_settings_row(r7, sel == 7, line);
+		}
 	}
 
 	// sel 8: Debug Messages (GLOBAL, debug builds only) — merged with UART Log.
@@ -1374,6 +1398,388 @@ static void explain_page(const char *title, const struct exline *ln, int n)
 		if (ln[i].t[0]) dbg_text(ln[i].col, 5 + i, ln[i].fg, BR_BG, ln[i].t);
 }
 
+// ────────────────────────────────────────────────────────────
+// Overclock sub-menu
+// ────────────────────────────────────────────────────────────
+// The single "Overclock" row had grown five separate controls hanging off five
+// buttons (L/R clock, Triangle/X voltage, Square stable, Select bus, START
+// diagnostics) and could not show them all inside one row's width. Everything to
+// do with clocks and rails lives here instead, one row each, using the same
+// geometry and helpers as the main settings page.
+//
+// Persistence: the CPU step, its Stable flag and the Tachyon voltage step ride
+// settings.cfg as before. Bus target and DDR step are deliberately live-only —
+// both are diagnostics, and a stored bad DDR voltage would re-apply every boot.
+#define OCM_ROWS 10
+// Minimum spacing between accepted D-pad actions. 220ms is slow enough that a
+// single deliberate press never double-fires, and still allows walking a row of
+// 12 levels without it feeling stuck.
+#define OCM_GATE_US 220000
+
+static void draw_oc_menu(int sel)
+{
+	char line[64], val[40];
+	int r1 = 5, r2 = 7, r3 = 9, r4 = 11;
+	int r5 = 13, r6 = 15, r7 = 17, r8 = 19;    // the four unidentified rails
+	int r9 = 23;                               // Mark as Stable - second last
+	int r10 = 27;                              // Rail Defaults - last, it acts on all of them
+	                                           // (r10/r11 leave one empty row between them)
+	int idx = (g_overclock_id >= 0 && g_overclock_id < OC_STEPS) ? g_overclock_id : 0;
+	int mhz10 = g_oc_freq_x10[idx];
+	int bt = g_oc_bus_tab[(g_oc_bus_sel >= 0 && g_oc_bus_sel < OC_BUS_TARGETS) ? g_oc_bus_sel : 0];
+	int pll = (idx == 0) ? 333 : mhz10 / 10;
+
+	draw_screen_chrome("Overclock", "Up/Dn sel  L/R change  R:Help  X:run  O Return");
+
+	// 1 CPU clock — raw PLL multiplier table; 0 is stock 333MHz.
+	if (idx == 0)        sprintf(val, "OFF (333 MHz)");
+	else if (mhz10 % 10) sprintf(val, "%d.%d MHz", mhz10 / 10, mhz10 % 10);
+	else                 sprintf(val, "%d MHz", mhz10 / 10);
+	settings_line(line, "CPU Clock:", val);
+	draw_settings_row(r1, sel == 1, line);
+
+	// 2 Bus clock — absolute MHz target, or sync (gear 1:1, bus rides the PLL).
+	// The domain is fed by PLL/2 through the gear, so sync's bus value is PLL/2 —
+	// always shown, "Sync with CPU" alone hid what it actually does. A fixed target
+	// that the current PLL cannot reach (num would exceed 1:1) silently clamps to
+	// sync, so say so instead of displaying a number the hardware refused.
+	{
+		if (bt > 0) {
+			if ((u32)(511 * 2 * bt / pll) > 0x1ff)
+				sprintf(val, "%d MHz (=sync, %d MHz)", bt, pll / 2);
+			else
+				sprintf(val, "%d MHz", bt);
+		} else {
+			sprintf(val, "Sync with CPU (%d MHz)", pll / 2);
+		}
+	}
+	settings_line(line, "Bus Clock:", val);
+	draw_settings_row(r2, sel == 2, line);
+
+	// 3 Tachyon voltage — ABSOLUTE level 0..11, higher = more volts. The chip's
+	// fuse-derived stock level is marked so the useful range is obvious at a glance.
+	if (!cv_ok()) sprintf(val, "unavailable");
+	else {
+		int lv = cv_level(), sl = cv_stock_level();
+		if (lv == sl) sprintf(val, "%d of %d  (0x%03X stock)", lv, CV_LEVEL_MAX, CV_LEVEL_TO_CODE(lv));
+		else          sprintf(val, "%d of %d  (0x%03X, stock %d)", lv, CV_LEVEL_MAX,
+		                      CV_LEVEL_TO_CODE(lv), sl);
+	}
+	settings_line(line, "Tachyon Voltage:", val);
+	draw_settings_row(r3, sel == 3, line);
+
+	// 4 DDR voltage — live only. The DIRECTION on this rail is not established, so
+	// the value is shown as a raw code rather than implying more or less volts.
+	if (cv_ddr_base() < 0) sprintf(val, "unknown");
+	else {
+		int lv = CV_CODE_TO_LEVEL(cv_ddr_code()), bl = cv_ddr_base_level();
+		if (lv == bl) sprintf(val, "%d of %d  (0x%03X boot)", lv, CV_LEVEL_MAX, CV_LEVEL_TO_CODE(lv));
+		else          sprintf(val, "%d of %d  (0x%03X, boot %d)", lv, CV_LEVEL_MAX,
+		                      CV_LEVEL_TO_CODE(lv), bl);
+	}
+	settings_line(line, "DDR Voltage:", val);
+	draw_settings_row(r4, sel == 4, line);
+
+	// 5-8 Unidentified rails (syscon selectors 2/4/5/7). The no-op sweep proved
+	// each accepts writes at its own register; what it FEEDS is unknown. They are
+	// named by their Pommel register — that is the only true thing we can call
+	// them — and drawn RED for the whole row, because "unidentified supply" is the
+	// single most important fact about them. Levels rather than volts, since the
+	// direction has only ever been measured on the Tachyon rail.
+	{
+		int i;
+		const int rows[4] = { r5, r6, r7, r8 };
+		char lbl[24];
+		for (i = 0; i < cv_rail_count(); i++) {
+			int b = cv_rail_base(i), c = cv_rail_code(i);
+			if (b < 0)       sprintf(val, "unreadable");
+			else if (c == b) sprintf(val, "%d of %d  (0x%03X boot)", CV_CODE_TO_LEVEL(c), CV_LEVEL_MAX, c);
+			else             sprintf(val, "%d of %d  (0x%03X, boot %d)", CV_CODE_TO_LEVEL(c),
+			                         CV_LEVEL_MAX, c, cv_rail_base_level(i));
+			// Separate label buffer: settings_line writes into its first argument
+			// while reading its second, so passing the same buffer for both is
+			// overlapping-sprintf UB.
+			sprintf(lbl, "Unknown reg %02X / %d:", cv_rail_reg(i), cv_rail_sel(i));
+			settings_line(line, lbl, val);
+			draw_settings_row_col(rows[i], sel == 5 + i, line, BR_RED);
+		}
+	}
+
+	// 9 Mark as Stable — placed SECOND LAST, deliberately away from the clock rows
+	// and past a visual gap: it is a promise about every rail above it, not another
+	// setting to roll a thumb through. Skips the every-boot confirm for the step
+	// and the voltage with it.
+	settings_line(line, "Mark as Stable:", g_overclock_stable ? "Yes" : "No");
+	if (g_overclock_stable && idx > 0) draw_settings_row_col(r9, sel == 9, line, BR_RED);
+	else                               draw_settings_row(r9, sel == 9, line);
+
+	// 10 Rail defaults — LAST, because it acts on every rail above it. X always has
+	// an effect: put every rail back on the baseline (Tachyon on fuse stock, DDR and
+	// the unknown rails on the stored reference). The Pommel keeps its registers
+	// across reboots and hard resets, so a crashed session can leave rails parked
+	// somewhere else; this row is the one-press way back.
+	sprintf(val, "X: restore all rails");
+	settings_line(line, "Rail Defaults:", val);
+	draw_settings_row(r10, sel == 10, line);
+
+	// Standing warning under the list. Everything below the Bus Clock row drives a
+	// real supply through the Pommel, and two of those rails are not identified at
+	// all — so this stays on screen rather than living only in a help page nobody
+	// opens. Rows 29-31 are clear of both the last row (27) and the footer (row 33).
+	dbg_text(2, 29, BR_RED, BR_BG, "WARNING: everything below Bus Clock changes a real");
+	dbg_text(2, 30, BR_RED, BR_BG, "supply voltage. Wrong values hang, corrupt or");
+	dbg_text(2, 31, BR_RED, BR_BG, "damage hardware. Rail Defaults (last row) fixes.");
+}
+
+static void oc_menu_explain(int sel);
+
+// Returns 1 if the global settings need saving (CPU step / Stable / Tachyon step).
+static int run_oc_menu(void)
+{
+	SceCtrlData pad;
+	int sel = 1, prev, changed = 0;
+	u32 gate_us = 0;      // no D-pad action accepted until this time
+
+	draw_oc_menu(sel);
+	kpeek(&pad); prev = pad.Buttons;
+	for (;;) {
+		int pressed, osel = sel, redraw = 0;
+		sceKernelDelayThread(40000);
+		kpeek(&pad);
+		pressed = pad.Buttons & ~prev;
+		prev = pad.Buttons;
+
+		// Rate gate on the D-pad. Edge detection alone gives one action per press,
+		// but a twitchy D-pad chatters across a 40ms sample and a row here can move
+		// a voltage rail — overshooting by two levels because the contact bounced is
+		// not acceptable. Nothing D-pad is accepted within OCM_GATE_US of the last
+		// accepted one; buttons (X/Triangle/O/R) are deliberately not gated.
+		if (pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) {
+			u32 now = sceKernelGetSystemTimeLow();
+			if (gate_us && (int)(now - gate_us) < 0)
+				pressed &= ~(PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_LEFT | PSP_CTRL_RIGHT);
+			else
+				gate_us = now + OCM_GATE_US;
+		}
+
+		if (pressed & PSP_CTRL_UP)   { sel = (sel > 1) ? sel - 1 : OCM_ROWS; redraw = 1; }
+		if (pressed & PSP_CTRL_DOWN) { sel = (sel < OCM_ROWS) ? sel + 1 : 1; redraw = 1; }
+		// Same debounce intent as the main page: a thumb rolling off the D-pad after
+		// a row change must not also adjust the new row.
+		if (sel != osel) pressed &= ~(PSP_CTRL_LEFT | PSP_CTRL_RIGHT);
+
+		if (pressed & PSP_CTRL_RTRIGGER) {
+			oc_menu_explain(sel);
+			draw_oc_menu(sel);
+			kpeek(&pad); prev = pad.Buttons;
+			continue;
+		}
+		if (pressed & PSP_CTRL_CIRCLE) break;
+
+		// CPU clock: does NOT wrap — wrapping would let LEFT at stock jump to the top.
+		if (sel == 1 && (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))) {
+			if ((pressed & PSP_CTRL_LEFT)  && g_overclock_id > 0)            g_overclock_id--;
+			if ((pressed & PSP_CTRL_RIGHT) && g_overclock_id < OC_STEPS - 1) g_overclock_id++;
+			g_overclock_stable = 0;   // a freshly picked step is not vouched for
+			changed = 1;
+			oc_apply(g_overclock_id);
+		}
+		else if (sel == 2 && (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))) {
+			if (pressed & PSP_CTRL_RIGHT) g_oc_bus_sel = (g_oc_bus_sel + 1) % OC_BUS_TARGETS;
+			else                          g_oc_bus_sel = (g_oc_bus_sel + OC_BUS_TARGETS - 1) % OC_BUS_TARGETS;
+			oc_apply(g_overclock_id);     // this is what re-ramps the gear registers
+		}
+		else if (sel == 3 && cv_ok() && (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))) {
+			cv_apply(cv_level() + ((pressed & PSP_CTRL_RIGHT) ? 1 : -1));
+			changed = 1;
+		}
+		else if (sel == 4 && (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))) {
+			// DDR: live only, never saved. One notch at a time.
+			cv_ddr_apply(CV_CODE_TO_LEVEL(cv_ddr_code()) + ((pressed & PSP_CTRL_RIGHT) ? 1 : -1));
+		}
+		else if (sel == 9 && (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT | PSP_CTRL_CROSS))) {
+			g_overclock_stable = !g_overclock_stable;
+			changed = 1;
+		}
+		else if (sel == 10 && (pressed & PSP_CTRL_CROSS)) {
+			// Only one action: adopt the reference and put the rails on it. The
+			// "capture what is running now" variant was removed — it is correct
+			// only in the instant after a real power-down, which is impossible on
+			// a console with a soldered battery, and pressing it at any other time
+			// would bake a leftover in as the permanent default.
+			cv_rail_defaults_builtin();
+			changed = 1;          // the baseline rides settings.cfg
+		}
+		else if (sel >= 5 && sel < 5 + cv_rail_count() &&
+		         (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))) {
+			// Unknown rail: live only, one notch at a time.
+			int i = sel - 5;
+			cv_rail_apply(i, CV_CODE_TO_LEVEL(cv_rail_code(i)) + ((pressed & PSP_CTRL_RIGHT) ? 1 : -1));
+		}
+		// Redraw only when something could have changed. The old unconditional call
+		// repainted the whole page every 40ms whether or not anything moved.
+		if (redraw || (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT |
+		                          PSP_CTRL_CROSS | PSP_CTRL_TRIANGLE)))
+			draw_oc_menu(sel);
+	}
+	wait_release(PSP_CTRL_CIRCLE);
+	return changed;
+}
+
+static void oc_menu_explain(int sel)
+{
+	switch (sel) {
+	case 1: {
+		static const struct exline b[] = {
+			EXB("Raises the CPU clock above stock by"),
+			EXB("writing the raw PLL registers."),
+			EXS(),
+			EXI("OFF      - stock 333 MHz (safe)"),
+			EXI("<higher> - faster, hotter, less stable"),
+			EXS(),
+			EXC("Ark-4's own 'Game overclock' must be"),
+			EXC("set to 'Overclocked' for this to work."),
+			EXS(),
+			EXC("Use only a step proven on your unit."),
+		};
+		explain_page("CPU Clock", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	case 2: {
+		static const struct exline b[] = {
+			EXB("The bus/GE/RAM domain is fed by PLL/2"),
+			EXB("through a gear ratio, so its ceiling is"),
+			EXB("half the CPU clock: sync = PLL/2 (the"),
+			EXB("value in brackets on the row)."),
+			EXS(),
+			EXC("333 MHz or more is NOT reachable: the"),
+			EXC("gear cannot exceed 1:1, so 333 would"),
+			EXC("need a 666MHz PLL. Above the ceiling a"),
+			EXC("target clamps to sync - the row shows"),
+			EXC("'(=sync)' when that has happened."),
+			EXS(),
+			EXB("Holding the bus back did NOT move the"),
+			EXB("crash point on this unit, though it"),
+			EXB("does cost frames."),
+			EXS(),
+			EXB("Live only - not saved."),
+		};
+		explain_page("Bus Clock", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	case 3: {
+		static const struct exline b[] = {
+			EXB("Core voltage of the Allegrex, set via"),
+			EXB("SYSCON to the Pommel DC-DC."),
+			EXS(),
+			EXB("A SMALLER code means MORE voltage."),
+			EXB("Stock is factory-binned per chip, so"),
+			EXB("headroom varies and may be zero. The"),
+			EXB("step is 0x100 - the hardware ignores"),
+			EXB("anything finer."),
+			EXS(),
+			EXC("mV per step is UNKNOWN."),
+		};
+		explain_page("Tachyon Voltage", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	case 4: {
+		static const struct exline b[] = {
+			EXB("Voltage of the DDR rail (syscon rail"),
+			EXB("selector 3, Pommel register 0x12)."),
+			EXS(),
+			EXC("The DIRECTION on this rail is NOT"),
+			EXC("established - only the Tachyon rail has"),
+			EXC("been measured. This rail holds the"),
+			EXC("running kernel: too little voltage"),
+			EXC("corrupts memory. Back up the Memory"),
+			EXC("Stick before touching it."),
+			EXS(),
+			EXB("Steps are +/-2 notches from the value"),
+			EXB("the rail booted at, and that boot value"),
+			EXB("is NOT constant: this unit has booted"),
+			EXB("at 0x300, 0x200 and 0x000. Warm resets"),
+			EXB("(psplink) have read 0x000 so far - a"),
+			EXB("full power cycle may differ."),
+			EXS(),
+			EXH("THE CODE IS WHAT MATTERS"),
+			EXB("An old build's '+2 from a 0x300 boot'"),
+			EXB("and a '-1 from a 0x000 boot' land on"),
+			EXB("the same 0x100. If RIGHT does nothing,"),
+			EXB("the rail booted at 0x000 and the volt"),
+			EXB("steps are the LEFT ones."),
+			EXS(),
+			EXB("Live only - never saved, so a bad value"),
+			EXB("cannot follow you across a reboot."),
+		};
+		explain_page("DDR Voltage", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	case 5: case 6: case 7: case 8: {
+		static char title[24];
+		static const struct exline b[] = {
+			EXB("An UNIDENTIFIED rail the syscon can"),
+			EXB("address. The no-op sweep proved this"),
+			EXB("selector accepts writes at its own"),
+			EXB("Pommel register - but not what it"),
+			EXB("feeds."),
+			EXS(),
+			EXB("Candidates on this board: LCD, back-"),
+			EXB("light, audio codec, remote/headphone"),
+			EXB("rail, SDRAM termination."),
+			EXS(),
+			EXC("WHAT IT FEEDS IS UNKNOWN. A step"),
+			EXC("changes an unidentified supply by an"),
+			EXC("unknown amount. If the screen dims,"),
+			EXB("sound distorts or anything else shifts,"),
+			EXB("that IS the identification - note it."),
+			EXS(),
+			EXB("Steps are +/-2 notches from the rail's"),
+			EXB("own boot value, live only, restored on"),
+			EXB("game exit."),
+		};
+		sprintf(title, "Unknown reg %02X / %d", cv_rail_reg(sel - 5), cv_rail_sel(sel - 5));
+		explain_page(title, b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	case 9: {
+		static const struct exline b[] = {
+			EXB("Vouches for the current CPU step and"),
+			EXB("voltage, so the every-boot confirm is"),
+			EXB("skipped and they apply straight away."),
+			EXS(),
+			EXC("Changing the CPU clock clears this."),
+		};
+		explain_page("Mark as Stable", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	default: {
+		static const struct exline b[] = {
+			EXB("One press puts every rail back: the"),
+			EXB("Tachyon rail on its fuse stock code,"),
+			EXB("the DDR and unknown rails on this"),
+			EXB("console's stored power-on reference."),
+			EXS(),
+			EXB("The Pommel keeps its registers through"),
+			EXB("a reboot AND a hard reset - only"),
+			EXB("pulling the battery and AC clears it."),
+			EXS(),
+			EXB("Nothing in the firmware reprograms the"),
+			EXB("DDR or unknown rails, so a crash leaves"),
+			EXB("them wherever they were. The reference"),
+			EXB("is re-applied at every start, which is"),
+			EXB("what makes that recoverable."),
+			EXS(),
+			EXB("Values read from this console before the"),
+			EXB("plugin could write these rails, agreeing"),
+			EXB("across several boots - so they are the"),
+			EXB("real power-on state, not a guess."),
+			EXS(),
+			EXB("The Tachyon rail does not strictly need"),
+			EXB("this - the IPL reprograms it from the"),
+			EXB("fuse every boot - but a stored V step"),
+			EXB("can sit on top of it; this clears that"),
+			EXB("too."),
+		};
+		explain_page("Rail Defaults", b, (int)(sizeof(b)/sizeof(b[0])));
+	} break;
+	}
+}
+
 static void settings_explain(int sel)
 {
 	switch (sel) {
@@ -1521,28 +1927,29 @@ static void settings_explain(int sel)
 		explain_page("Stop Charging", b, (int)(sizeof(b)/sizeof(b[0])));
 	} break;
 	case 7: {
+		// Short now: every control moved into the Overclock sub-page, which carries
+		// its own per-row help (see oc_menu_explain).
 		static const struct exline b[] = {
 			EXB("Raises the CPU clock above stock by"),
 			EXB("writing the raw PLL registers."),
 			EXS(),
-			EXH("VALUES  (L/R cycles)"),
-			EXI("OFF      - stock 333 MHz (safe)"),
-			EXI("<higher> - faster, but hotter and"),
-			EXI("           less stable; a too-high"),
-			EXI("           step can hang or crash."),
+			EXH("HERE"),
+			EXI("L/R      - pick the frequency"),
+			EXI("Triangle - mark it Stable (skips the"),
+			EXI("           every-boot confirm)"),
 			EXS(),
-			EXC("NOTE: Ark-4's own 'Game overclock'"),
-			EXC("setting must be set to 'Overclocked'"),
-			EXC("for this to take effect."),
+			EXC("Ark-4's own 'Game overclock' must be"),
+			EXC("set to 'Overclocked' for this to work."),
 			EXS(),
-			EXB("Triangle marks a step 'Stable' (skips"),
-			EXB("the every-boot confirm); X clears it."),
+			EXH("X = ADVANCED PAGE"),
+			EXB("Bus clock, Tachyon and DDR"),
+			EXB("voltage, and the unidentified rails."),
+			EXC("Those change real supply voltages and"),
+			EXC("are for tinkering, not for setting a"),
+			EXC("clock. You do not need them."),
 			EXS(),
 			EXH("SCOPE"),
 			EXB("Applies to every game."),
-			EXS(),
-			EXC("Use only a step proven stable on your"),
-			EXC("unit. When in doubt, leave OFF."),
 		};
 		explain_page("Overclock", b, (int)(sizeof(b)/sizeof(b[0])));
 	} break;
@@ -1818,8 +2225,8 @@ static int run_settings_menu(const char *gid)
 		// (Left/Right stays "change value" elsewhere):
 		//   Show FPS (row 2, while a mode is on): Triangle = +0.1s, X = -0.1s on the
 		//     update rate (g_fps_rate 1..10 = 0.1..1.0s -> fps_window_us).
-		//   Overclock (row 6, non-stock only): Triangle = mark STABLE (skip the boot confirm,
-		//     shown RED), X = clear it back to the normal white "ask every boot".
+		//   Overclock (row 7, non-stock only): Triangle = mark the step STABLE (skips
+		//     the every-boot confirm, shown RED); press again to clear it.
 		//   Intro Video Skip (row 11, only once a timer is captured = TIMED): Triangle = +0.1s,
 		//     X = -0.1s on the learned window (clamped to 0.1s .. VSKIP_LEARN_MAX_MS).
 		if (sel == 2 && g_show_fps_overlay > 0 && (pressed & (PSP_CTRL_TRIANGLE | PSP_CTRL_CROSS))) {
@@ -1828,9 +2235,17 @@ static int run_settings_menu(const char *gid)
 			changed = 1;
 			draw_settings(sel, gid);
 		}
-		if (sel == 7 && g_overclock_id > 0 && (pressed & (PSP_CTRL_TRIANGLE | PSP_CTRL_CROSS))) {
-			if (pressed & PSP_CTRL_TRIANGLE) g_overclock_stable = 1;
-			if (pressed & PSP_CTRL_CROSS)    g_overclock_stable = 0;
+		// Overclock row: X opens the advanced page (bus, voltage rails).
+		if (sel == 7 && (pressed & PSP_CTRL_CROSS)) {
+			if (run_oc_menu()) changed = 1;
+			draw_settings(sel, gid);
+			kpeek(&pad); prev = pad.Buttons;
+			continue;
+		}
+		// Triangle marks the current step Stable (skips the every-boot confirm), the
+		// same key it has always been on this row. Pressing it again clears it.
+		if (sel == 7 && g_overclock_id > 0 && (pressed & PSP_CTRL_TRIANGLE)) {
+			g_overclock_stable = !g_overclock_stable;
 			changed = 1;
 			draw_settings(sel, gid);
 		}
@@ -1931,12 +2346,12 @@ static int run_settings_menu(const char *gid)
 			changed = 1;   // global settings.cfg
 			draw_settings(sel, gid);
 		} else if (sel == 7 && (pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))) {
-			// Overclock: Left/Right step the multiplier table (0 = stock 333MHz). Applied
-			// immediately, live — see oc_apply. Deliberately does NOT wrap (unlike the other
-			// settings): wrapping would let LEFT at stock jump straight to the top step.
-			if ((pressed & PSP_CTRL_LEFT)  && g_overclock_id > 0)             g_overclock_id--;
-			if ((pressed & PSP_CTRL_RIGHT) && g_overclock_id < OC_STEPS - 1)  g_overclock_id++;
-			g_overclock_stable = 0;   // a newly picked step isn't vouched for -> confirm again next boot
+			// Overclock: Left/Right step the multiplier table (0 = stock 333MHz),
+			// applied live. Deliberately does NOT wrap, unlike the other settings —
+			// wrapping would let LEFT at stock jump straight to the top step.
+			if ((pressed & PSP_CTRL_LEFT)  && g_overclock_id > 0)            g_overclock_id--;
+			if ((pressed & PSP_CTRL_RIGHT) && g_overclock_id < OC_STEPS - 1) g_overclock_id++;
+			g_overclock_stable = 0;   // a newly picked step is not vouched for
 			changed = 1;
 			oc_apply(g_overclock_id);
 			draw_settings(sel, gid);
@@ -2520,6 +2935,8 @@ int menu_thread(SceSize args, void *argp)
 
 	while (1) {
 		sceKernelSleepThread();          // woken by the controller hook (NOTE tap OR boot auto-open)
+		cv_poll_reapply();               // a firmware resume reset the core voltage; put the step back
+		                                 // (thread context — ProcessSignals may not do syscon I/O)
 
 		// Boot auto-open: the hook only SIGNALLED us (no game-thread MS). Do the per-game MS
 		// check HERE (menu thread = safe). If enabled AND a save exists, open on the newest save.
@@ -2568,8 +2985,16 @@ int menu_thread(SceSize args, void *argp)
 				int do_arm = (g_video_skip == VSKIP_CAPTURE);
 				oc_confirm_needed = 0;   // one-shot regardless
 				if (oc_pending && g_overclock_stable) {
+					if (g_corevolt_level >= 0) cv_apply(g_corevolt_level);   // volts up BEFORE the clock
 					oc_apply(g_overclock_id);
-					if (DBG_UART()) { char b[56]; sprintf(b, "[OC] stable: applied step %d, no confirm", g_overclock_id); uart_puts(b); }
+				}
+				// No overclock this boot -> no reason to carry a voltage step either.
+				// Clearing it here (rather than leaving the row showing V+N while the rail
+				// sits at stock) keeps the displayed value honest.
+				if (!oc_pending && g_corevolt_level >= 0) {
+					g_corevolt_level = CV_LEVEL_NONE;
+					cv_revert();
+					save_settings();
 				}
 				if (do_oc || do_arm) {
 					g_menu_open = 1;

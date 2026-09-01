@@ -2,6 +2,7 @@
 #include "gfx.h"
 #include "debug.h"
 #include "overclock.h"
+#include "corevolt.h"
 #include "sysstats.h"
 #include "videoskip.h"
 #include "menu.h"
@@ -393,6 +394,11 @@ int battery_poll_thread(SceSize args, void *argp)
 {
 	(void)args; (void)argp;
 	while (1) {
+		// This thread already does syscon transactions at its own pace, so it is a
+		// legal place to put a non-stock core-voltage step back after a firmware
+		// resume (ProcessSignals only raises the flag — see corevolt.c). The menu
+		// thread does the same on wake, for when this thread isn't running.
+		cv_poll_reapply();
 		// Exit only when there is NOTHING to do: overlay off AND no Stop-Charging
 		// threshold. A threshold alone keeps this thread alive so the gate keeps
 		// being enforced even with the battery overlay off.

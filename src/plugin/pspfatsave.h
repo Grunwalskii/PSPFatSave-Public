@@ -69,6 +69,18 @@ int SysEventShim(int ev_id, char *ev_name, void *param, int *result);
 extern int g_overclock_id;
 void oc_apply(int id);
 
+// ── Core voltage (shared corevolt.c <-> utils.c <-> menu.c) ──
+// g_corevolt_level: GLOBAL persisted ABSOLUTE voltage level, 0..11 with higher
+// meaning more volts (CV_LEVEL_NONE = leave the rail at the chip's stock code).
+// It used to be a signed offset from stock; absolute is reproducible, an offset
+// from a baseline that varies per boot is not. See corevolt.h.
+// g_corevolt_reapply: ProcessSignals sets it on
+// RESUME_COMPLETED and the menu thread acts on it, because applying the step is a
+// syscon transaction and sceSysconCmdExec rejects interrupt context (unlike
+// oc_apply, which is only PLL register writes and so is safe in the handler).
+extern int g_corevolt_level;
+extern volatile int g_corevolt_reapply;
+
 // Compression chunk size. fastlz processes the game RAM / VRAM / kernel in
 // SAVE_CHUNK_SIZE input chunks.
 #define SAVE_CHUNK_SIZE   0x10000   // 64KB input chunks

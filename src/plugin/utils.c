@@ -275,6 +275,13 @@ int ProcessSignals(int ev_id, char *ev_name, void *param, int *result)
 		}
 		// Re-apply overclock after resume.
 		if (g_overclock_id > 0) oc_apply(g_overclock_id);
+		// The core voltage also comes back at whatever scePower's own state says, so
+		// a non-stock step has to be re-applied too — but only ASK for it here.
+		// cv_apply talks to the syscon, and sceSysconCmdExec refuses to run in
+		// interrupt context (SCE_ERROR_ILLEGAL_CONTEXT); oc_apply above is safe here
+		// only because it is nothing but PLL register writes. cv_poll_reapply() on the
+		// menu thread does the real work.
+		if (g_corevolt_level >= 0) g_corevolt_reapply = 1;   // >=0 = a level was set (see corevolt.h)
 		g_resumed = 1; // wait_for_resume() polls this to detect the firmware resume
 	}
 

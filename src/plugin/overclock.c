@@ -8,6 +8,7 @@
 #include "fatsave.h"
 #include "screen_tuning.h"   /* st_stop — this file owns the only game-exit hook */
 #include "cheats.h"          /* cheats_stop — same game-exit teardown */
+#include "corevolt.h"        /* cv_probe/cv_boot_apply/cv_revert — core voltage rides with the clock */
 
 // ── Overclock (raw PLL register control, PSP-1000 only) ──────────────────────
 // Frequency model: MHz = 37 * num / den (37 = PLL base). num is the 8-bit field in the
@@ -70,13 +71,53 @@ static void oc_unlock_regs(void)
 	OC_SYNC();
 }
 
-// Ramp the clock-domain ratio registers (0xbc200000/0xBC200004) up to 511:511 (their
-// 1:1 ceiling) in fixed steps.
-static void oc_adjust_domain_ratios(void)
+// Ramp the clock-domain ratio registers to their targets in fixed steps: the CPU
+// domain to its 1:1 ceiling, the BUS domain to whatever gear realises its requested
+// absolute MHz (or, for target 0, sync — 1:1). See overclock.h for the gear/MHz
+// solver. The ME domain (0xBC200008) is deliberately NOT touched: the plugin never
+// used to write it, so the ME keeps the firmware's boot fraction.
+//
+// The two domains are genuinely independent: the firmware programs them from two
+// separate (num, den) pairs via sceClkcSetCpuGear / sceClkcSetBusGear (scePower
+// @0x880E282C), which are exactly these two registers. Pinning both to 1:1 was
+// inherited from the psp-beyond-444mhz reference, not a hardware requirement.
+// [0] = 0 = sync (gear 1:1, bus scales with the PLL). The rest are absolute targets.
+const short g_oc_bus_tab[OC_BUS_TARGETS] = { 0, 111, 133, 166, 190, 222, 266 };
+int g_oc_bus_sel = 0;             // index into g_oc_bus_tab; 0 = the historic behaviour
+u32 g_oc_cpu_num = 0, g_oc_cpu_den = 0;   // gears READ BACK after the ramp
+u32 g_oc_bus_num = 0, g_oc_bus_den = 0;
+u32 g_oc_bus_want = 0;                    // what we asked for; differs => hardware refused
+
+// One field, one tick, toward its own target — in EITHER direction. The bus ratio
+// has to be able to come down, which the old increment-only ramp could not do.
+static u32 oc_ramp1(u32 v, u32 target, u32 step)
+{
+	if (v < target) { v += step; if (v > target) v = target; }
+	else if (v > target) { v = (v < target + step) ? target : v - step; }
+	return v;
+}
+
+// busMhz = 0 leaves the bus gear at 1:1; otherwise it is solved against the PLL
+// frequency this step is about to run at (freqX10 = MHz * 10).
+static void oc_adjust_domain_ratios(int busMhz, int freqX10)
 {
 	unsigned int intr; int ds;
 	u32 cpu, bus, cpuDen, cpuNum, busDen, busNum;
-	const int step = 18;
+	const u32 tCpuNum = 0x1ff, tCpuDen = 0x1ff, tBusDen = 0x1ff;
+	u32 tBusNum;
+	const u32 step = 18;
+	int guard;
+
+	if (busMhz <= 0 || freqX10 <= 0) {
+		tBusNum = 0x1ff;                       // sync: bus rides the PLL, as before
+	} else {
+		// num = 511 * 2 * busMhz / pllMhz, with pllMhz = freqX10/10 folded in and
+		// half-ulp rounding: (10220 * busMhz + freqX10/2) / freqX10.
+		int n = (10220 * busMhz + freqX10 / 2) / freqX10;
+		if (n < 1)     n = 1;
+		if (n > 0x1ff) n = 0x1ff;              // asking for more than sync just gives sync
+		tBusNum = (u32)n;
+	}
 
 	ds = sceKernelSuspendDispatchThread();
 	intr = sceKernelCpuSuspendIntr();
@@ -90,17 +131,31 @@ static void oc_adjust_domain_ratios(void)
 	OC_HW(0xBC200004) = (busNum << 16) | busDen;
 	oc_settle();
 
-	while ((cpuNum & cpuDen & busNum & busDen) != 0x1ff) {
-		u32 nCpuNum = cpuNum + step, nCpuDen = cpuDen + step;
-		u32 nBusNum = busNum + step, nBusDen = busDen + step;
-		cpuNum = (nCpuNum > 0x1ff) ? 0x1ff : nCpuNum;
-		cpuDen = (nCpuDen > 0x1ff) ? 0x1ff : nCpuDen;
-		busNum = (nBusNum > 0x1ff) ? 0x1ff : nBusNum;
-		busDen = (nBusDen > 0x1ff) ? 0x1ff : nBusDen;
+	// Walk each field toward ITS OWN target. The old condition was
+	// "while ((cpuNum & cpuDen & busNum & busDen) != 0x1ff)", which never
+	// terminates once a target sits below 0x1ff — and it spins with interrupts
+	// off, so `guard` caps it regardless (max distance 0x1ff / step 18 = 29).
+	for (guard = 0; guard < 64; guard++) {
+		if (cpuNum == tCpuNum && cpuDen == tCpuDen &&
+		    busNum == tBusNum && busDen == tBusDen) break;
+		cpuNum = oc_ramp1(cpuNum, tCpuNum, step);
+		cpuDen = oc_ramp1(cpuDen, tCpuDen, step);
+		busNum = oc_ramp1(busNum, tBusNum, step);
+		busDen = oc_ramp1(busDen, tBusDen, step);
 		OC_HW(0xbc200000) = (cpuNum << 16) | cpuDen;
 		OC_HW(0xBC200004) = (busNum << 16) | busDen;
 		oc_settle();
 	}
+
+	// Read the registers BACK rather than recording what we meant to write. The
+	// reference implementation only ever ramps both domains to 1:1, so an arbitrary
+	// bus ratio is untested territory — the hardware may clamp it, ignore it, or
+	// require num == den. Logging the intent would have hidden that.
+	cpu = OC_HW(0xbc200000); bus = OC_HW(0xBC200004);
+	OC_SYNC();
+	g_oc_cpu_num = (cpu >> 16) & 0x1ff; g_oc_cpu_den = cpu & 0x1ff;
+	g_oc_bus_num = (bus >> 16) & 0x1ff; g_oc_bus_den = bus & 0x1ff;
+	g_oc_bus_want = tBusNum;
 
 	sceKernelCpuResumeIntr(intr);
 	sceKernelResumeDispatchThread(ds);
@@ -138,24 +193,33 @@ static u32 oc_decode_getter_addr(u32 fn)
 	return 0;
 }
 
-// Resolve one getter's backing address (read-only — no writes happen here) and
-// log what it found when UART logging is on, so a failed decode is visible
-// instead of silently doing nothing. Shared by oc_probe_hud_getters below.
-static u32 oc_resolve_hud_addr(u32 nid, const char *label)
+// Resolve one getter's backing address (read-only — no writes happen here).
+// Shared by oc_probe_hud_getters below.
+static u32 oc_resolve_hud_addr(u32 nid)
 {
 	u32 fn = sctrlHENFindFunction("scePower_Service", "scePower_driver", nid);
-	u32 addr = fn ? oc_decode_getter_addr(fn) : 0;
-	if (DBG_UART()) {
-		if (addr) { char b[48]; sprintf(b, "[OC] HUD %s var @", label); uart_log_hex(b, addr); }
-		else      { char b[48]; sprintf(b, "[OC] HUD %s var: not resolved", label); uart_puts(b); }
-	}
-	return addr;
+	return fn ? oc_decode_getter_addr(fn) : 0;
 }
+
+// DO NOT add sceClkcGetCpuGear / sceClkcGetBusGear here as int (*)(void). v975 did
+// exactly that and crashed the console at boot: a "gear" is a (num, den) PAIR, so
+// those functions return nothing and write through OUTPUT POINTERS. Called with no
+// arguments they stored to whatever junk was in a1 —
+//   cause=Address store  badvaddr=000000b2  a1=000000b2
+//   EPC in sceLowIO_Driver +0x2b10, RA in this module
+// with a0 holding 0x01ff01ff, the gear register it had just read and was about to
+// write out. Nothing here needs them anyway: oc_adjust_domain_ratios reads
+// 0xBC200000/4/8 directly, which is the hardware rather than a driver's copy.
+//
+// The two *Frequency getters above are safe because a frequency is a single int, so
+// their (void) signature is consistent with the name. That difference is the whole
+// lesson: infer the signature from what the function has to return, and if it could
+// be an out-param, do not call it blind.
 
 static void oc_probe_hud_getters(void)
 {
-	g_hud_cpu_freq_addr = oc_resolve_hud_addr(0xFDB5BFE9, "cpu-freq");
-	g_hud_bus_freq_addr = oc_resolve_hud_addr(0xBD681969, "bus-freq");
+	g_hud_cpu_freq_addr = oc_resolve_hud_addr(0xFDB5BFE9);
+	g_hud_bus_freq_addr = oc_resolve_hud_addr(0xBD681969);
 }
 
 // Write the PLL multiplier for step `id` (0..OC_STEPS-1, 0 = stock 333MHz). Called
@@ -167,43 +231,30 @@ void oc_apply(int id)
 
 	if (id < 0 || id >= OC_STEPS) id = 0;
 
-	// UART checkpoints (unconditional, register-only) around each step.
-	uart_puts("[OC1] enter");
-	oc_adjust_domain_ratios();
-	uart_puts("[OC2] ratios done");
+	oc_adjust_domain_ratios(g_oc_bus_tab[(g_oc_bus_sel >= 0 && g_oc_bus_sel < OC_BUS_TARGETS) ? g_oc_bus_sel : 0],
+	                        g_oc_freq_x10[id]);
 
 	ds = sceKernelSuspendDispatchThread();
 	intr = sceKernelCpuSuspendIntr();
-	uart_puts("[OC3] dispatch+intr off");
 
 	OC_HW(0xbc100068) = 0x85;
 	OC_SYNC();
-	uart_puts("[OC4] ctrl=0x85 written");
 	oc_pll_ready();
-	uart_puts("[OC5] pll ready");
 	oc_settle();
 
 	mul = g_oc_multipliers[id];
 	OC_HW(0xbc1000fc) = (OC_HW(0xbc1000fc) & 0xffff0000) | (mul << 8) | OC_DEN;
 	OC_SYNC();
-	uart_puts("[OC6] multiplier written");
 	oc_settle();
 
 	sceKernelCpuResumeIntr(intr);
 	sceKernelResumeDispatchThread(ds);
-	uart_puts("[OC7] dispatch+intr on");
 
 	sceKernelDelayThread(100);
 
 	mhz10 = g_oc_freq_x10[id];
 	if (g_hud_cpu_freq_addr) *((volatile u32 *)g_hud_cpu_freq_addr) = (u32)((mhz10 + 5) / 10);
 	if (g_hud_bus_freq_addr) *((volatile u32 *)g_hud_bus_freq_addr) = (u32)(((mhz10 + 5) / 10) / 2);
-
-	if (DBG_UART()) {
-		char buf[64];
-		sprintf(buf, "[OC] applied step %d -> %d.%dMHz", id, mhz10 / 10, mhz10 % 10);
-		WriteDebugLog(buf);
-	}
 }
 
 // ── Revert to stock on game exit ──────────────────────────────────────────
@@ -222,9 +273,17 @@ static void oc_exit_game_patched(void)
 {
 	cheats_stop();   // stop the FPS apply thread before game RAM is torn down
 	st_stop();
-	uart_puts("[OC0] st_stop done");   // confirms we reached the revert step
 	if (g_overclock_id > 0) oc_apply(0);
-	uart_puts("[OC] exit -> real");
+	// NO syscon calls here (cv_revert / cv_ddr_revert / cv_rails_revert were here
+	// once). Calling sceSysconCtrlVoltage from the patched-ExitGame syscall context
+	// crashed inside sceSYSCON_Driver (Address store, badvaddr=deadbf27, the driver
+	// walking a poisoned 0xdeadbeef packet pointer, repeating in the exception
+	// handler) - this is not the thread context those transactions require. Nothing
+	// is lost by skipping them: the Tachyon rail is reprogrammed from the fuse by
+	// the IPL/scePower on every boot, and the DDR/unknown rails are re-baselined by
+	// Rail Defaults at the next plugin start (cv_rails_boot_init) - the Pommel keeps
+	// its registers across exit. Hypothesis-level on the exact mechanism; the crash
+	// signature is from one observed exit, not a reproduced series.
 	// Drain the GE to idle before the real exit call.
 	{ int i; for (i = 0; i < 40; i++) {
 		if (sceGeDrawSync(1) == PSP_GE_LIST_DONE) break;
@@ -237,9 +296,8 @@ static int oc_exit_game_status_patched(int status)
 {
 	cheats_stop();   // stop the FPS apply thread before game RAM is torn down
 	st_stop();
-	uart_puts("[OC0] st_stop done");   // confirms we reached the revert step
 	if (g_overclock_id > 0) oc_apply(0);
-	uart_puts("[OC] exitstatus -> real");   // see oc_exit_game_patched
+	// No syscon calls here either - see the comment in oc_exit_game_patched.
 	{ int i; for (i = 0; i < 40; i++) {
 		if (sceGeDrawSync(1) == PSP_GE_LIST_DONE) break;
 		sceKernelDelayThread(200);
@@ -267,7 +325,20 @@ void oc_init(void)
 {
 	sceKernelIcacheInvalidateAll();
 	oc_unlock_regs();
+	// NOTE: with ARK-4's "overclock" setting enabled this call does NOTHING.
+	// ARK applies 333/166 itself and then overwrites scePowerSetClockFrequency (and
+	// five other clock setters) with "jr $ra; li $v0,0" — see ARK-4
+	// core/systemctrl/src/cpuclock.c SetSpeed(). Harmless, since ARK has already put
+	// the hardware exactly where this call would: it is kept for the case where that
+	// setting is off. The same stubbing is why scePower can never reprogram the core
+	// voltage behind us, so cv_apply's syscon write is the only thing that matters.
 	scePowerSetClockFrequency(333, 333, 166);
+	// AFTER the baseline call: that is what programs the stock (333MHz) core-voltage
+	// code, so the probe reads a settled state. Probe ONLY — a persisted voltage step
+	// is not applied here. It rides the overclock's boot decision instead (see
+	// boot_frozen_prompts / the STABLE branch in menu_thread), so an overvolt can
+	// never come back silently across a reboot.
+	cv_probe();
 	oc_probe_hud_getters();
 	oc_install_exit_hook();
 }
