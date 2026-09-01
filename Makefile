@@ -19,7 +19,7 @@ PSPSDK_PATH = $(shell psp-config --pspsdk-path)
 
 # Source files in src/plugin, build objects in build/
 VPATH = src/plugin:build
-OBJS = build/main.o build/fatsave.o build/gfx.o build/debug.o build/overclock.o build/sysstats.o build/videoskip.o build/menu.o build/screen_tuning.o build/cheats.o build/utils.o build/uart.o build/crash_handler.o build/fastlz_compress.o build/fastlz_decompress.o build/extras.o build/stub.o build/exports.o build/apply.o
+OBJS = build/main.o build/fatsave.o build/gfx.o build/debug.o build/overclock.o build/corevolt.o build/sysstats.o build/videoskip.o build/menu.o build/screen_tuning.o build/cheats.o build/utils.o build/uart.o build/crash_handler.o build/fastlz_compress.o build/fastlz_decompress.o build/extras.o build/stub.o build/exports.o build/apply.o
 
 $(OBJS): src/plugin/pspfatsave.h src/plugin/version.h
 
