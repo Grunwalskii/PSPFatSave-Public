@@ -1,5 +1,95 @@
 Sad that I have to prove my hard work:
 
+7b9c68d 2026-09-01 17:53:35 +0200 Grunwalskii
+    v981: Rail Defaults reworked + warning text. (1) Rail Defaults now also restores the Tachyon rail to its fuse-derived stock code - previously only DDR + unknown rails were managed while the persisted V step from settings.cfg rode along, which is why the row showed 9 of 11 when fuse stock is 7; restore writes fuse stock and clears the step. (2) Row text 'active - X re-applies'/'OFF - X restores them' replaced with the action 'X: restore all rails' (a restore is an action, not a state), help page rewritten. (3) Warning now reads 'hang, corrupt or damage hardware'
+
+efee382 2026-09-01 17:46:35 +0200 Grunwalskii
+    v980: two fixes. (1) OC menu highlight/input split - v978 reorder left the draw code highlighting the four unknown rails as rows 6-9 while the input handler addressed them as 5-8: rows 5-8 never showed a selection and row 9 lit BOTH 'Mark as Stable' and the last rail at once. Draw now uses sel==5+i; full row audit done (1 CPU, 2 bus, 3 tachyon, 4 DDR, 5-8 rails, 9 stable, 10 defaults) across input, drawing and help pages. (2) exit crash - sceSysconCtrlVoltage/pommel calls from the patched-ExitGame hook crashed sceSYSCON_Driver (Address store badvaddr=deadbf27, driver walking a 0xdeadbeef packet pointer, exception-looping); all syscon traffic removed from the exit hooks, PLL revert kept (raw registers, no syscon). Nothing lost: Tachyon rail is fuse-reprogrammed every boot, DDR/unknown rails re-baselined by Rail Defaults at next plugin start
+
+10e0a40 2026-09-01 17:38:58 +0200 Grunwalskii
+    v979: fix - stale 'Mark as Stable' handler still bound to row 2 swallowed every Bus Clock L/R press (leftover from the v978 reorder, my miss); warning block also moved down one row (29-31) so it sits clearer of Rail Defaults
+
+e968f6a 2026-09-01 17:34:18 +0200 Grunwalskii
+    v978: Overclock page reorder - 'Mark as Stable' moved to second-last position (row 9) with an empty visual row before 'Rail Defaults' (last); warning text now says 'below Bus Clock' since Bus Clock (row 2) is where the real-supply rows begin; help pages renumbered to match
+
+c5e0d3e 2026-09-01 17:24:47 +0200 Grunwalskii
+    v984: settings generation bumped to 'SETH' (settings.cfg rejected+rewritten once, old overclock/voltage rows from the debug-era build cannot leak in); ME clock fully removed from code (overclock.c no longer writes 0xBC200008 at all - ME keeps the firmware boot fraction, oc_adjust_domain_ratios ramps only CPU+BUS gears); ALL overclock/overvoltage debug stripped: [OC0]-[OC7] UART checkpoints, [OC]/[CV]/[IDS]/[POM]/[DDR]/[RAIL]/[DEF] log lines, IdStorage + Pommel-dump diagnostics probes (silent register sweep kept - rails read their boot codes from it), dead sceClkc getter resolution; menu Overclock page now 10 rows
+
+776a89a 2026-09-01 16:02:36 +0200 Grunwalskii
+    v976: revert the v975 sysreg logging - it crashed the console at every boot. sceClkcGetCpuGear/GetBusGear were declared int (*)(void), but a gear is a (num,den) PAIR so those functions write through OUTPUT POINTERS; called with no arguments they stored to the junk in a1 (cause=Address store badvaddr=000000b2 a1=000000b2, EPC in sceLowIO_Driver +0x2b10, a0 holding the 0x01ff01ff it had just read). The two *Frequency getters are safe because a frequency is one int, which is consistent with their (void) signature - that difference is now a comment where the next person would add the same call
+
+24a6791 2026-09-01 15:55:57 +0200 Grunwalskii
+    v975: log the whole sceSysreg clock API at boot (sceSysregPllGetFrequency, sceClkcGetCpuGear, sceClkcGetBusGear alongside the existing frequency getters) - the clkc frequency values are period-like, so MHz = PLL * 511 / value, and the PLL getter is the missing term that turns them into absolute numbers instead of a bare ratio; also shows whether the driver getters track the raw gear registers or a cached copy. Relevant to the ME row: sceSysreg_driver exposes Set/Get Gear and Set/Get Frequency for CPU and BUS only, with no ME clock function of any kind - the only ME entries are MeBusClockEnable/Disable and MeResetEnable/Disable - so the firmware adjusts exactly two domains and calling 0xBC200008 the ME gear is inference from register adjacency, not something any source names
+
+a1d9ca5 2026-09-01 15:51:55 +0200 Grunwalskii
+    v974: unidentified rail rows relabelled 'Unknown reg 11 / 2:' (Pommel register / syscon selector) instead of the abbreviated 'UNK reg 11 (sel 2):', on the rows and on their help page title; 19 characters, still inside the 20-wide label field
+
+574ce6f 2026-09-01 15:48:03 +0200 Grunwalskii
+    v973: standing red warning under the advanced Overclock list - everything below the CPU Clock row drives a real supply through the Pommel and two of those rails are unidentified, so the warning lives on the page itself rather than only in a help text nobody opens; rows 28-30, clear of the last row (25) and the footer (33)
+
+7302bf5 2026-09-01 15:44:59 +0200 Grunwalskii
+    v970: the main settings Overclock row behaves as it always did again - Left/Right pick the CPU frequency and Triangle marks a step Stable - so a normal user never has to leave that page or meet a voltage rail; X opens the advanced page (bus, ME, Tachyon/DDR voltage, unidentified rails) as an opt-in. Also moves Rail Defaults to the LAST row of that page since it acts on every rail above it (rails renumber 8..11 to 7..10 across draw, input and help, and the rail help title now matches its row label), and drops the two live read-out lines under the list - every value was already on a row or in the UART log, and the gear line was ~68 chars on a 60-column screen so it was clipped anyway
+
+2a429bd 2026-09-01 15:36:10 +0200 Grunwalskii
+    v969: Overclock page usability - the four unidentified rails are now named by their Pommel register (UNK reg 11 sel 2 etc) and drawn RED for the whole row, since 'unidentified supply' is the important fact about them; a 220ms rate gate on the D-pad stops a bouncy contact stepping a voltage rail twice per press, and the page only repaints when something actually changed instead of every 40ms. Rail Defaults loses the capture action (correct only in the instant after a battery-out power-down, impossible on a soldered console, and a footgun at any other time) leaving one X = restore the reference. Also fixes settings_line(line, line, val) passing the same buffer as output and label, which is overlapping-sprintf UB
+
+6ee62ab 2026-09-01 15:27:07 +0200 Grunwalskii
+    v968: Rail Defaults gains Triangle = adopt a built-in reference baseline, for consoles where the battery is soldered in and the Pommel therefore cannot be cleared at all. The reference is not a guess: the v950/v951/v953 boot dumps, taken before the plugin could write these rails, agreed across several boots on 0400 0600 0200 0200 0200 ---- 0300, so DDR/sel2/sel4/sel5/sel7 = levels 9/5/9/9/8. It is offered rather than auto-applied because it is one unit's measurement; with no baseline stored the boot log now just reports how many rails differ from it
+
+898dc2a 2026-09-01 15:17:31 +0200 Grunwalskii
+    v967: the Pommel keeps its registers across a reboot AND a hard reset, and nothing in the firmware reprograms the DDR or unknown rails - so a crashed or power-switched session left them parked at whatever was last written (which also explains the 'DDR boot value varies 0x300/0x200/0x000' puzzle: those were this plugin's own leftovers read back as the boot value). Adds a rail baseline persisted in settings.cfg word [15] and re-applied by cv_probe at every plugin start, plus a Rail Defaults row to capture it (X) - capture after a real battery-out power-down for it to mean anything. Removes the Diagnostics row and both one-shot probes, which had answered their questions; settings.cfg SETF->SETG
+
+fe9aebc 2026-09-01 14:58:55 +0200 Grunwalskii
+    v966: replace the signed step-from-baseline model with an ABSOLUTE voltage LEVEL 0..11 where higher means more volts (level 11 = code 0x000, level 0 = code 0xB00) on all four rail types - an offset from the DDR/unknown-rail boot code was meaningless because that code varies between boots, so the same +1 was a different voltage on different days; levels are reproducible. Rows show 'N of 11 (0xNNN)' with the stock/boot level called out, CV_LEVEL_NONE marks untouched, and settings.cfg bumps SETE->SETF because word [14] changed meaning
+
+0181bf4 2026-09-01 14:51:30 +0200 Grunwalskii
+    v965: fix three defects in the v957-v964 overclock/voltage work - (1) the ME boot gear was captured inside #if DEBUG_BUILD while oc_adjust_domain_ratios depends on it, so a RELEASE build fell through to the 1:1 fallback and ramped the ME gear to 1:1 on every oc_apply, the exact silent ME overclock that row exists to prevent; (2) cv_ddr_apply and cv_rail_apply clamped only the code, not the step, so the step kept counting past the end of the span and the control went dead until walked all the way back; (3) the settings.cfg load clamp still used the removed CV_MAX_DOWN and disagreed with cv_apply in both directions. Also removes the dead CV_DDR_MAX_STEP/CV_RAIL_MAX_STEP defines and the comments that still described caps the code no longer has
+
+f4229be 2026-09-01 06:42:12 +0200 Grunwalskii
+    v964: full-span rail stepping is the DEFAULT - the Unlock toggle row is removed and the +/-2 caps are gone everywhere: DDR and the unknown rails step the whole 0x000..0xB00 span from their boot values, Tachyon undervolt runs to 0xB00 (overvolt still ends at the 0x000 encoding floor); per-step logs and single-register readbacks unchanged; page back to 11 rows
+
+b7d1169 2026-09-01 06:32:33 +0200 Grunwalskii
+    v963: Unlock Rails toggle on the Overclock page (row 12, live-only, default off) - ON lifts the +/-2 notch caps: DDR and unknown rails can sweep the full 0x000..0xB00 span from their boot values, and the Tachyon UNDERvolt opens from -2 to the full span (overvolt still ends at the 0x000 floor since that is the encoding limit); each write still logs and single-register readbacks still fire; help page carries the danger notes (rail values this low can corrupt memory, and sticky clocks survive a warm reboot)
+
+6facdc2 2026-09-01 06:15:42 +0200 Grunwalskii
+    v962: unknown-rail rows named by selector ID ('Rail Sel 2/4/5/7 (reg 0x11/13/14/16)'), help page titled per selector, and each rail step now reads back just its own register (~34ms, not the full sweep) logging 'reg reads NNNN' plus a did-NOT-follow warning - full cross-register diff stays in Diagnostics on demand
+
+c4b2891 2026-09-01 06:11:06 +0200 Grunwalskii
+    v960: the four UNKNOWN rails (syscon selectors 2/4/5/7, Pommel regs 0x11/0x13/0x14/0x16 - proven writable by the no-op sweep, identity unknown) get their own Overclock rows with the same live-only +/-2-notch stepping as DDR, raw-code display, per-step UART log, and game-exit revert; page now 11 rows with the live readout moved down; settings.cfg magic SETD->SETE so the new build starts from a clean defaults file
+
+6ae5fb0 2026-09-01 06:01:18 +0200 Grunwalskii
+    v959: ME Clock row on the Overclock page (0xBC200008, the third domain gear the plugin never touched - a PLL overclock silently sped the ME up ~2x): Sync keeps the firmware boot fraction (historic behaviour, its MHz shown via the logged PLL/2-base assumption) or pin 111/133/166/190/222 MHz; ME gear solved+read back like the bus, boot gear logged at init to verify the PLL/2 assumption (~111 expected); DDR help text now explains that the boot value varies and old-build +2 == today's -1 (same absolute code)
+
+00ae528 2026-09-01 05:34:39 +0200 Grunwalskii
+    v957: DDR rail back to the capped +/-2-notches-from-boot-value mode (the unlocked sweep is reverted - the boot value is not constant across boots, this unit has read 0x300/0x200/0x000) and every per-step read-back removed (Tachyon no longer sweeps the Pommel diff after a write, DDR no longer brackets with battery-current averages + a reg-12 read); Bus row always shows its value now - sync displays PLL/2 in brackets, an unreachable fixed target shows '(=sync)'; help pages explain the PLL/2 ceiling (333+ MHz bus is unreachable, gear cannot exceed 1:1) and the DDR boot-value variance
+
+b605e3a 2026-09-01 05:03:11 +0200 Grunwalskii
+    v956: unlock the DDR rail to the full 0x000-0xB00 code range (step limits derived from the boot value instead of a fixed +/-2) and show the raw code with floor/ceiling tags; replace the useless before/after battery-current read with an 8-sample average per side plus the within-side spread, since sceSysconBatteryGetElec is syscon-averaged and never moved when sampled in the same breath as the write
+
+b25021b 2026-09-01 04:50:56 +0200 Grunwalskii
+    v955: Overclock becomes its own sub-page (X on the settings row) with one row each for CPU Clock, Mark as Stable, Bus Clock, Tachyon Voltage, DDR Voltage and Diagnostics, per-row help and a live read-out - the single row had five controls on five buttons and no width left; adds DDR rail control (selector 3 / Pommel reg 0x12) logging the reg-12 read-back and battery current either side, live-only and reverted on game exit
+
+b65bea1 2026-09-01 04:28:30 +0200 Grunwalskii
+    v954: read the clock-domain gear registers BACK after the ramp and log want-vs-got - the bus target computed 341/511 but clkc did not move, and logging our own intent hid whether the hardware accepted the write; also show the live Vcode instead of -1 when the voltage has not been touched
+
+5ed9b18 2026-09-01 04:19:16 +0200 Grunwalskii
+    v953: rail-selector probe is now one selector per confirm, showing the previous result before each decision - the earlier 'bounded to a few notches' claim was unfounded, since the Tachyon rail is the only one whose encoding has been measured, so a wrong mapping moves an unknown rail by an unknown amount
+
+daf3271 2026-09-01 04:12:31 +0200 Grunwalskii
+    v952: bus clock is now an absolute MHz target (Select cycles sync/111/133/166/190/222/266) solved against the PLL instead of a 1-over-N divider, plus real sceClkc cpu/bus frequency logging; START on the Overclock row runs the DAC sub-step probe (risk-free) and, behind a confirm, a rail-selector sweep that writes each selector the value its predicted Pommel register already holds
+
+46b6909 2026-09-01 03:46:47 +0200 Grunwalskii
+    v951: read-only IdStorage voltage-calibration probe (leaf 4 tachyon pair at 0x20/0x21, leaf 6 DDR + third rail, (b and 0x7F)<<8 with bit7 = present) - a second calibration source the fuse-only reading missed; Pommel diff now rescans only registers that answered and reports the first failure code; correct the oc_init comment about ARK-4 stubbing scePowerSetClockFrequency
+
+82f0410 2026-09-01 03:11:24 +0200 Grunwalskii
+    v950: bus-clock divider (Select on the Overclock row, live only, 1:1..1:4) with a bidirectional per-field ratio ramp, stock-gear read-out at boot, and a read-only Pommel register dump (full at boot, changed-only after every voltage step)
+
+55cfb4f 2026-09-01 02:52:31 +0200 Grunwalskii
+    v949: core voltage now rides the overclock boot decision - named in the confirm prompt, applied just before the clock on accept, cleared on decline and when the overclock is OFF (no more silent overvolt across reboots); oc_apply logs the live Vcode
+
+789e4ca 2026-09-01 02:36:56 +0200 Grunwalskii
+    v948: core voltage - UART read-out of the Tachyon fuse + a Core Voltage step on the Overclock row (Triangle/X); STABLE moves to Square; settings.cfg SETC->SETD (word [14])
+
 4f51d30 2026-08-31 21:27:01 +0200 Grunwalskii
     Fix Sync-Public.ps1 file list: drop renamed gamma.c/h, add screen_tuning, crash_handler, cheats modules
 
