@@ -65,6 +65,7 @@ If you enjoy this project and want to support its development, you can buy me a 
 
 **System Settings** (global, all games)
 - Overclock (PSP-1000 only; raw PLL registers, 0 = stock 333MHz)
+- Overvoltage & Undervoltage
 - Overlay Location: choose which screen corner the FPS/battery/CPU overlay appears in
 - Debug Messages (UART logging + on-screen markers, debug build only)
 
