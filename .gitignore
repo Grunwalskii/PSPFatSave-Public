@@ -27,3 +27,6 @@ Desktop.ini
 *.swp
 *.swo
 *~
+
+# Release zips (kept as GitHub release assets, not in the source tree)
+*.zip
